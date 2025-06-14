@@ -54,7 +54,14 @@ async function checkWallets() {
     }
   }
 }
-
+async function fetchTokenName(mintAddress) {
+  try {
+    const response = await axios.get(`https://token-list-api.solana.com/token/${mintAddress}`);
+    return response.data.name || 'Inconnu';
+  } catch {
+    return null;
+  }
+}
 async function sendTelegramAlert(mint, data) {
   const tokenName = await fetchTokenName(mint); // À implémenter
   const msg = `🚨 *Achat groupé détecté!*\n\n` +
