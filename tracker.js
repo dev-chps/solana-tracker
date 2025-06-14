@@ -1,57 +1,56 @@
 const { Connection, PublicKey } = require('@solana/web3.js');
+const axios = require('axios');
 
 // Config
 const RPC_URL = process.env.RPC_URL;
 const WALLETS = process.env.WALLETS.split(',');
+const TG_TOKEN = process.env.TG_TOKEN;
+const TG_CHAT_ID = process.env.TG_CHAT_ID;
 const connection = new Connection(RPC_URL, {
   commitment: 'confirmed',
-  httpHeaders: { 
-    'maxSupportedTransactionVersion': 0 
-  }
+  httpHeaders: { 'maxSupportedTransactionVersion': 0 }
 });
 
-// Cache pour éviter les doublons
-const processedTxs = new Set();
+// Envoi d'alerte Telegram
+async function sendAlert(wallet, tx) {
+  const msg = `🔄 *Nouvelle TX Solana* \n\n` +
+             `👛 Wallet: \`${wallet.substring(0, 6)}...\`\n` +
+             `📊 Montant: ${tx.amount || '?'} SOL\n` +
+             `🔗 [Voir TX](https://solscan.io/tx/${tx.signature})`;
+  
+  try {
+    await axios.post(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+      chat_id: TG_CHAT_ID,
+      text: msg,
+      parse_mode: 'Markdown',
+      disable_web_page_preview: true
+    });
+  } catch (error) {
+    console.error('Erreur Telegram:', error.message);
+  }
+}
 
 async function trackWallet(wallet) {
   try {
     const pubKey = new PublicKey(wallet);
-    const txs = await connection.getSignaturesForAddress(pubKey, { limit: 5 });
-    
-    console.log(`\n🔍 ${wallet.substring(0, 6)}...`);
+    const txs = await connection.getSignaturesForAddress(pubKey, { limit: 3 });
     
     for (const tx of txs) {
-      if (processedTxs.has(tx.signature)) continue;
-      processedTxs.add(tx.signature);
-      
-      console.log(`📜 TX: ${tx.signature.substring(0, 8)}...`);
-      console.log(`⏳ ${new Date(tx.blockTime*1000).toLocaleString()}`);
-      console.log(`🔗 https://solscan.io/tx/${tx.signature}`);
+      await sendAlert(wallet, {
+        signature: tx.signature,
+        amount: (tx.amount / 1e9).toFixed(2) // Conversion en SOL
+      });
     }
   } catch (error) {
-    console.error(`❌ ${wallet.substring(0, 6)}:`, error.message);
+    console.error(`❌ Erreur sur ${wallet.substring(0, 6)}:`, error.message);
   }
 }
 
-// Traitement par batch avec délai
+// Exécution
 async function run() {
-  console.log("=== SCAN STARTED ===");
-  console.log(`Tracking ${WALLETS.length} wallets...`);
-  
-  const BATCH_SIZE = 3; // 3 wallets à la fois
-  const DELAY_MS = 1500; // 1.5s entre les batchs
-  
-  for (let i = 0; i < WALLETS.length; i += BATCH_SIZE) {
-    const batch = WALLETS.slice(i, i + BATCH_SIZE);
-    await Promise.all(batch.map(trackWallet));
-    
-    if (i + BATCH_SIZE < WALLETS.length) {
-      await new Promise(resolve => setTimeout(resolve, DELAY_MS));
-    }
-  }
-
-  console.log("=== SCAN COMPLETED ===");
-  setTimeout(run, 6 * 60 * 60 * 1000); // Relance dans 6h
+  console.log(`Début du scan (${WALLETS.length} wallets)...`);
+  await Promise.all(WALLETS.map(trackWallet));
+  setTimeout(run, 6 * 60 * 60 * 1000); // Toutes les 6h
 }
 
 run();
