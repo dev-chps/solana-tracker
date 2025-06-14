@@ -1,0 +1,11 @@
+{
+  "name": "solana-tracker",
+  "version": "1.0.0",
+  "main": "tracker.js",
+  "dependencies": {
+    "@solana/web3.js": "^1.73.0"
+  },
+  "scripts": {
+    "start": "node tracker.js"
+  }
+}
