@@ -1,5 +1,5 @@
 const http = require('http');
-const { Connection, PublicKey } = require('@solana/web3.js');
+const { Connection, PublicKey, LAMPORTS_PER_SOL } = require('@solana/web3.js');
 const axios = require('axios');
 
 // Configuration
@@ -8,9 +8,21 @@ const WALLETS = process.env.WALLETS ? process.env.WALLETS.split(',') : [];
 const TG_TOKEN = process.env.TG_TOKEN;
 const TG_CHAT_ID = process.env.TG_CHAT_ID;
 const TEST_TOKEN = process.env.TEST_TOKEN || "default-secret";
-const MIN_SOL_AMOUNT = process.env.MIN_SOL_AMOUNT ? parseFloat(process.env.MIN_SOL_AMOUNT) : 10;
-const MIN_WALLETS = process.env.MIN_WALLETS ? parseInt(process.env.MIN_WALLETS) : 3;
-const CHECK_INTERVAL = process.env.CHECK_INTERVAL ? parseInt(process.env.CHECK_INTERVAL) : 30 * 60 * 1000; // 30 minutes
+const CHECK_INTERVAL = process.env.CHECK_INTERVAL ? parseInt(process.env.CHECK_INTERVAL) : 5 * 60 * 1000; // 5 minutes
+
+// Price thresholds (in USD)
+const LARGE_PURCHASE_THRESHOLD = 1000; // $1000
+const SOL_THRESHOLD = 10; // 10 SOL
+
+// Token addresses
+const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+const SOL_MINT = 'So11111111111111111111111111111111111111112';
+
+// Price cache
+let tokenPrices = {
+  [USDC_MINT]: 1, // USDC is pegged to $1
+  [SOL_MINT]: null // Will fetch SOL price
+};
 
 // Initialize Solana connection
 const connection = new Connection(RPC_URL, {
@@ -19,16 +31,28 @@ const connection = new Connection(RPC_URL, {
 });
 
 // Trackers
-const tokenTracker = {};
-const processedTxs = new Set();
+const tokenPurchases = {}; // Tracks token buys across wallets
+const processedTxs = new Set(); // Prevents duplicate processing
+
+/**
+ * Fetches current SOL price in USD
+ */
+async function fetchSOLPrice() {
+  try {
+    const response = await axios.get('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
+    tokenPrices[SOL_MINT] = response.data.solana.usd;
+    console.log(`SOL price updated: $${tokenPrices[SOL_MINT]}`);
+  } catch (error) {
+    console.error("Error fetching SOL price:", error.message);
+  }
+}
 
 /**
  * Sends alert to Telegram
- * @param {string} message - The alert message to send
  */
 async function sendTelegramAlert(message) {
   if (!TG_TOKEN || !TG_CHAT_ID) {
-    console.warn("Telegram credentials not configured - alert would be:", message);
+    console.warn("Telegram not configured. Alert would be:", message);
     return;
   }
 
@@ -38,123 +62,148 @@ async function sendTelegramAlert(message) {
       text: message,
       parse_mode: 'Markdown'
     });
-    console.log("Telegram alert sent successfully");
   } catch (error) {
     console.error("Failed to send Telegram alert:", error.message);
   }
 }
 
 /**
- * Fetches token name from mint address
- * @param {string} mintAddress - The token mint address
- * @returns {Promise<string>} - Token name or mint address if not found
+ * Gets token symbol from mint address
  */
-async function fetchTokenName(mintAddress) {
+async function getTokenSymbol(mintAddress) {
+  const tokenMap = {
+    [USDC_MINT]: 'USDC',
+    [SOL_MINT]: 'SOL'
+  };
+  
+  if (tokenMap[mintAddress]) return tokenMap[mintAddress];
+  
   try {
     const response = await axios.get(`https://api.solscan.io/token/${mintAddress}`);
-    return response.data.data.tokenName || mintAddress;
-  } catch (error) {
-    console.error(`Error fetching token name for ${mintAddress}:`, error.message);
-    return mintAddress;
+    return response.data.data.tokenSymbol || mintAddress.slice(0, 4) + '...' + mintAddress.slice(-4);
+  } catch {
+    return mintAddress.slice(0, 4) + '...' + mintAddress.slice(-4);
   }
 }
 
 /**
- * Checks all configured wallets for balances and transactions
+ * Checks wallet transactions for significant purchases
  */
-async function checkWallets() {
+async function checkWalletTransactions(wallet) {
   try {
-    console.log("🚀 Starting wallet checks...");
-    
-    // Check if we have enough wallets configured
-    if (WALLETS.length < MIN_WALLETS) {
-      const warning = `⚠️ Only ${WALLETS.length} wallets configured (minimum ${MIN_WALLETS} recommended)`;
-      console.warn(warning);
-      await sendTelegramAlert(warning);
-    }
+    const publicKey = new PublicKey(wallet);
+    const transactions = await connection.getConfirmedSignaturesForAddress2(publicKey, {
+      limit: 10
+    });
 
-    // Check each wallet's balance and recent activity
-    for (const wallet of WALLETS) {
-      try {
-        const publicKey = new PublicKey(wallet);
-        
-        // Check SOL balance
-        const balance = await connection.getBalance(publicKey);
-        const solBalance = balance / 10**9; // Convert lamports to SOL
-        
-        console.log(`💰 Wallet ${wallet.slice(0, 4)}...${wallet.slice(-4)} balance: ${solBalance.toFixed(2)} SOL`);
-        
-        if (solBalance < MIN_SOL_AMOUNT) {
-          const alertMsg = `⚠️ Low balance alert: Wallet ${wallet.slice(0, 4)}...${wallet.slice(-4)} has only ${solBalance.toFixed(2)} SOL (minimum ${MIN_SOL_AMOUNT} SOL recommended)`;
-          await sendTelegramAlert(alertMsg);
-        }
+    for (const tx of transactions) {
+      if (processedTxs.has(tx.signature)) continue;
 
-        // Check recent transactions (last 5)
-        const transactions = await connection.getConfirmedSignaturesForAddress2(publicKey, { limit: 5 });
-        
-        for (const tx of transactions) {
-          if (processedTxs.has(tx.signature)) continue;
-          
-          const txDetails = await connection.getParsedTransaction(tx.signature);
-          await analyzeTransaction(txDetails, wallet);
-          processedTxs.add(tx.signature);
-        }
-      } catch (error) {
-        console.error(`❌ Error checking wallet ${wallet}:`, error.message);
-      }
+      const txDetails = await connection.getParsedTransaction(tx.signature);
+      await analyzeTransaction(txDetails, wallet);
+      processedTxs.add(tx.signature);
     }
   } catch (error) {
-    console.error("❌ Error in checkWallets:", error);
-    await sendTelegramAlert(`🛑 Critical error in wallet checks: ${error.message}`);
+    console.error(`Error checking transactions for ${wallet}:`, error.message);
   }
 }
 
 /**
- * Analyzes transaction for token movements
- * @param {object} transaction - The parsed transaction
- * @param {string} walletAddress - The wallet address
+ * Analyzes transaction for significant token purchases
  */
-async function analyzeTransaction(transaction, walletAddress) {
+async function analyzeTransaction(transaction, wallet) {
   if (!transaction || !transaction.message || !transaction.message.instructions) return;
 
   for (const instruction of transaction.message.instructions) {
     if (instruction.parsed && instruction.parsed.type === 'transfer') {
       const tokenMint = instruction.parsed.info.mint;
       const amount = instruction.parsed.info.tokenAmount.uiAmount;
-      const symbol = instruction.parsed.info.tokenAmount.symbol || await fetchTokenName(tokenMint);
+      const decimals = instruction.parsed.info.tokenAmount.decimals;
+      const rawAmount = instruction.parsed.info.tokenAmount.amount;
 
-      // Track token movements
-      if (!tokenTracker[tokenMint]) {
-        tokenTracker[tokenMint] = {
-          count: 0,
+      // Get token symbol
+      const symbol = await getTokenSymbol(tokenMint);
+
+      // Calculate USD value
+      let usdValue = 0;
+      if (tokenPrices[tokenMint]) {
+        usdValue = amount * tokenPrices[tokenMint];
+      }
+
+      // Check for large purchases
+      if (tokenMint === SOL_MINT && amount >= SOL_THRESHOLD) {
+        const message = `🚨 Large SOL Purchase!\n` +
+                       `Wallet: ${wallet.slice(0, 4)}...${wallet.slice(-4)}\n` +
+                       `Amount: ${amount} SOL\n` +
+                       `Value: ~$${usdValue.toFixed(2)}`;
+        await sendTelegramAlert(message);
+      }
+      else if (tokenMint === USDC_MINT && amount >= LARGE_PURCHASE_THRESHOLD) {
+        const message = `🚨 Large USDC Purchase!\n` +
+                       `Wallet: ${wallet.slice(0, 4)}...${wallet.slice(-4)}\n` +
+                       `Amount: ${amount} USDC`;
+        await sendTelegramAlert(message);
+      }
+      else if (usdValue >= LARGE_PURCHASE_THRESHOLD) {
+        const message = `🚨 Large Token Purchase!\n` +
+                       `Wallet: ${wallet.slice(0, 4)}...${wallet.slice(-4)}\n` +
+                       `Token: ${symbol}\n` +
+                       `Amount: ${amount}\n` +
+                       `Value: ~$${usdValue.toFixed(2)}`;
+        await sendTelegramAlert(message);
+      }
+
+      // Track token purchases across wallets
+      if (!tokenPurchases[tokenMint]) {
+        tokenPurchases[tokenMint] = {
+          symbol,
           wallets: new Set(),
-          amount: 0,
-          symbol: symbol
+          count: 0,
+          totalAmount: 0
         };
       }
 
-      tokenTracker[tokenMint].count++;
-      tokenTracker[tokenMint].wallets.add(walletAddress);
-      tokenTracker[tokenMint].amount += amount;
+      tokenPurchases[tokenMint].wallets.add(wallet);
+      tokenPurchases[tokenMint].count++;
+      tokenPurchases[tokenMint].totalAmount += amount;
 
-      // Check if threshold is reached
-      if (tokenTracker[tokenMint].count >= 3) {
-        const alertMsg = `🚨 Token movement detected!\n` +
-                        `Token: ${tokenTracker[tokenMint].symbol}\n` +
-                        `Count: ${tokenTracker[tokenMint].count} transactions\n` +
-                        `Amount: ${tokenTracker[tokenMint].amount.toFixed(2)}\n` +
-                        `Wallets: ${Array.from(tokenTracker[tokenMint].wallets).map(w => w.slice(0, 4) + '...' + w.slice(-4)).join(', ')}`;
+      // Check if 3+ wallets bought the same token
+      if (tokenPurchases[tokenMint].wallets.size >= 3) {
+        const message = `🚨 Multiple Wallets Buying Same Token!\n` +
+                       `Token: ${symbol}\n` +
+                       `Wallets: ${tokenPurchases[tokenMint].wallets.size}\n` +
+                       `Total Transactions: ${tokenPurchases[tokenMint].count}\n` +
+                       `Total Amount: ${tokenPurchases[tokenMint].totalAmount}`;
+        await sendTelegramAlert(message);
         
-        await sendTelegramAlert(alertMsg);
-        tokenTracker[tokenMint].count = 0; // Reset after alert
+        // Reset after alert
+        tokenPurchases[tokenMint].wallets.clear();
+        tokenPurchases[tokenMint].count = 0;
+        tokenPurchases[tokenMint].totalAmount = 0;
       }
     }
   }
 }
 
-// HTTP Server with test endpoint
+/**
+ * Main checking function
+ */
+async function checkWallets() {
+  try {
+    console.log("🔄 Checking wallets...");
+    await fetchSOLPrice(); // Update SOL price first
+
+    for (const wallet of WALLETS) {
+      await checkWalletTransactions(wallet);
+    }
+  } catch (error) {
+    console.error("Error in checkWallets:", error);
+    await sendTelegramAlert(`🛑 Error in wallet checks: ${error.message}`);
+  }
+}
+
+// HTTP Server
 const server = http.createServer(async (req, res) => {
-  // Test endpoint
   if (req.method === 'POST' && req.url === '/trigger-test') {
     if (req.headers['x-test-token'] !== TEST_TOKEN) {
       res.writeHead(403);
@@ -162,9 +211,9 @@ const server = http.createServer(async (req, res) => {
     }
 
     try {
-      await sendTelegramAlert("🔔 Test alert: System is functioning normally");
+      await sendTelegramAlert("🔔 Test alert: System is working normally");
       res.writeHead(200);
-      res.end("Test alert sent successfully!");
+      res.end("Test alert sent!");
     } catch (error) {
       res.writeHead(500);
       res.end("Error: " + error.message);
@@ -172,36 +221,24 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Health check endpoint
-  if (req.method === 'GET' && req.url === '/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({
-      status: 'online',
-      wallets: WALLETS.length,
-      lastChecked: new Date().toISOString()
-    }));
-  }
-
-  // Default response
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ 
     status: 'online',
-    endpoints: {
-      test: 'POST /trigger-test',
-      health: 'GET /health'
+    wallets: WALLETS.length,
+    thresholds: {
+      sol: SOL_THRESHOLD,
+      usd: LARGE_PURCHASE_THRESHOLD
     }
   }));
 }).listen(process.env.PORT || 3000, () => {
-  console.log(`🚀 Server ready on port ${process.env.PORT || 3000}`);
+  console.log(`🚀 Server running on port ${process.env.PORT || 3000}`);
   checkWallets();
   setInterval(checkWallets, CHECK_INTERVAL);
 });
 
-// Handle process termination
 process.on('SIGTERM', () => {
-  console.log('🛑 Received SIGTERM, shutting down gracefully');
   server.close(() => {
-    console.log('🔴 Server closed');
+    console.log('Server shutdown');
     process.exit(0);
   });
 });
