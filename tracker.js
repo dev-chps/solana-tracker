@@ -1,18 +1,6 @@
 // Ajoutez en haut du fichier :
 const http = require('http');
 
-// [...] (votre code existant)
-
-// Mini serveur pour Render (à la fin du fichier)
-const server = http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('Solana Tracker is running');
-}).listen(process.env.PORT || 3000, () => {
-  console.log(`Server dummy running on port ${process.env.PORT || 3000}`);
-});
-
-// Gardez votre logique existante
-setInterval(checkWallets, 30 * 60 * 1000);
 const { Connection, PublicKey } = require('@solana/web3.js');
 const axios = require('axios');
 
@@ -94,3 +82,15 @@ async function sendTelegramAlert(mint, data) {
 
 // À exécuter périodiquement
 setInterval(checkWallets, 30 * 60 * 1000); // Toutes les 30 min
+
+
+// Mini serveur pour Render (à la fin du fichier)
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('Solana Tracker is running');
+}).listen(process.env.PORT || 3000, () => {
+  console.log(`Server dummy running on port ${process.env.PORT || 3000}`);
+});
+
+// Gardez votre logique existante
+setInterval(checkWallets, 30 * 60 * 1000);
