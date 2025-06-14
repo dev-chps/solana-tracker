@@ -1,7 +1,7 @@
 const http = require('http');
 const { Connection, PublicKey } = require('@solana/web3.js');
 const axios = require('axios');
-
+const processedTxs = new Set(); // Anti-doublons
 // Config
 const RPC_URL = process.env.RPC_URL;
 const WALLETS = process.env.WALLETS.split(',');
@@ -11,9 +11,11 @@ const MIN_SOL_AMOUNT = 10; // Filtre les TX > 10 SOL
 const MIN_WALLETS = 3; // Nombre minimal de wallets pour alerter
 const connection = new Connection(RPC_URL, {
   commitment: 'confirmed',
-  httpHeaders: { 'maxSupportedTransactionVersion': 0 }
+  httpHeaders: {
+    'Content-Type': 'application/json',
+    'maxSupportedTransactionVersion': 0
+  }
 });
-
 // Dictionnaire pour tracker les tokens
 const tokenTracker = {};
 const processedTxs = new Set(); // Évite les doublons
@@ -34,27 +36,33 @@ async function analyzeTransaction(signature, wallet) {
   processedTxs.add(signature);
 
   try {
-    const tx = await connection.getParsedTransaction(signature);
+    const tx = await connection.getParsedTransaction(signature, {
+      maxSupportedTransactionVersion: 0,
+      commitment: 'confirmed'
+    });
+
     if (!tx) return null;
 
-    const transferInstruction = tx.transaction.message.instructions.find(ix => 
+    // Détection précise des transfers entrants
+    const transfer = tx.transaction.message.instructions.find(ix => 
       ix.programId?.equals(new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")) &&
       ix.parsed?.type === 'transfer' &&
       ix.parsed?.info?.destination === wallet
     );
 
-    if (!transferInstruction) return null;
+    if (!transfer?.parsed?.info?.amount) return null;
 
-    const amount = transferInstruction.parsed.info.amount / 1e9; // Conversion en SOL
-    if (amount < MIN_SOL_AMOUNT) return null;
+    const amountSol = transfer.parsed.info.amount / 1e9;
+    if (amountSol < MIN_SOL_AMOUNT) return null;
 
     return {
-      mint: transferInstruction.parsed.info.mint,
-      amount: amount,
+      mint: transfer.parsed.info.mint,
+      amount: amountSol,
       signature: signature
     };
+
   } catch (error) {
-    console.error(`❌ Erreur analyse TX ${signature.substring(0, 8)}: ${error.message}`);
+    console.error(`❌ TX ${signature.substring(0, 8)}: ${error.message}`);
     return null;
   }
 }
