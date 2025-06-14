@@ -1,7 +1,7 @@
 {
   "name": "solana-wallet-tracker",
   "version": "1.0.0",
-  "description": "A bot to track Solana wallet transactions and send Telegram alerts",
+  "description": "Tracks Solana wallet activity and sends Telegram alerts",
   "main": "tracker.js",
   "scripts": {
     "start": "node tracker.js",
