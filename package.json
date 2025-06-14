@@ -1,4 +1,12 @@
-"dependencies": {
-  "@solana/web3.js": "^1.73.0",
-  "axios": "^1.6.7"  // Version récente
+{
+  "name": "solana-tracker",
+  "version": "1.0.1",  // ← Changez la version (ex: 1.0.0 → 1.0.1)
+  "dependencies": {
+    "@solana/web3.js": "^1.73.0",
+    "axios": "^1.6.7"  // ← Bien vérifier cette ligne
+  },
+  "scripts": {
+    "start": "node tracker.js",
+    "install-deps": "npm install"  // ← Nouveau script
+  }
 }
