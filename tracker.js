@@ -1,14 +1,17 @@
 const http = require('http');
 const { Connection, PublicKey } = require('@solana/web3.js');
 const axios = require('axios');
-const processedTxs = new Set(); // Anti-doublons
-// Config
+
+// ======================
+// CONFIGURATION
+// ======================
 const RPC_URL = process.env.RPC_URL;
 const WALLETS = process.env.WALLETS.split(',');
 const TG_TOKEN = process.env.TG_TOKEN;
 const TG_CHAT_ID = process.env.TG_CHAT_ID;
-const MIN_SOL_AMOUNT = 10; // Filtre les TX > 10 SOL
-const MIN_WALLETS = 3; // Nombre minimal de wallets pour alerter
+const MIN_SOL_AMOUNT = 10;
+const MIN_WALLETS = 3;
+
 const connection = new Connection(RPC_URL, {
   commitment: 'confirmed',
   httpHeaders: {
@@ -16,34 +19,34 @@ const connection = new Connection(RPC_URL, {
     'maxSupportedTransactionVersion': 0
   }
 });
-// Dictionnaire pour tracker les tokens
-const tokenTracker = {};
-const processedTxs = new Set(); // Évite les doublons
 
-// Fonction pour récupérer le nom des tokens
+const tokenTracker = {};
+const processedTxs = new Set(); // Déclaration UNIQUE ici
+
+// ======================
+// FONCTIONS PRINCIPALES
+// ======================
+
 async function fetchTokenName(mintAddress) {
   try {
-    const response = await axios.get('https://token-list-api.solana.com/token/' + mintAddress);
+    const response = await axios.get(`https://token-list-api.solana.com/token/${mintAddress}`);
     return response.data.name || mintAddress.substring(0, 6) + '...';
   } catch {
     return mintAddress.substring(0, 6) + '...';
   }
 }
 
-// Analyse détaillée des transactions
 async function analyzeTransaction(signature, wallet) {
   if (processedTxs.has(signature)) return null;
   processedTxs.add(signature);
 
   try {
     const tx = await connection.getParsedTransaction(signature, {
-      maxSupportedTransactionVersion: 0,
-      commitment: 'confirmed'
+      maxSupportedTransactionVersion: 0
     });
 
     if (!tx) return null;
 
-    // Détection précise des transfers entrants
     const transfer = tx.transaction.message.instructions.find(ix => 
       ix.programId?.equals(new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")) &&
       ix.parsed?.type === 'transfer' &&
@@ -53,13 +56,11 @@ async function analyzeTransaction(signature, wallet) {
     if (!transfer?.parsed?.info?.amount) return null;
 
     const amountSol = transfer.parsed.info.amount / 1e9;
-    if (amountSol < MIN_SOL_AMOUNT) return null;
-
-    return {
+    return amountSol >= MIN_SOL_AMOUNT ? {
       mint: transfer.parsed.info.mint,
       amount: amountSol,
       signature: signature
-    };
+    } : null;
 
   } catch (error) {
     console.error(`❌ TX ${signature.substring(0, 8)}: ${error.message}`);
@@ -67,14 +68,13 @@ async function analyzeTransaction(signature, wallet) {
   }
 }
 
-// Fonction d'alerte Telegram améliorée
 async function sendTelegramAlert(mint, data) {
   const tokenName = await fetchTokenName(mint);
-  const msg = `🚨 *Achat groupé détecté!* (${data.count} wallets)\n\n` +
+  const msg = `🚨 *Achat groupé détecté!*\n\n` +
              `🪙 Token: ${tokenName}\n` +
-             `📍 Contrat: \`${mint.substring(0, 6)}...\`\n` +
+             `👛 Wallets: ${data.count} (${data.wallets.slice(0, 3).map(w => w.substring(0, 6)).join(', ')}...)\n` +
              `💰 Montant moyen: ${(data.amount/data.count).toFixed(2)} SOL\n` +
-             `🔗 [Voir token](https://solscan.io/token/${mint})`;
+             `🔍 [Voir token](https://solscan.io/token/${mint})`;
 
   try {
     await axios.post(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
@@ -89,7 +89,6 @@ async function sendTelegramAlert(mint, data) {
   }
 }
 
-// Vérification des wallets
 async function checkWallets() {
   console.log(`\n🔍 Scanning ${WALLETS.length} wallets...`);
   
@@ -126,7 +125,9 @@ async function checkWallets() {
   }
 }
 
-// Serveur HTTP minimal
+// ======================
+// SERVEUR HTTP
+// ======================
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({
