@@ -1,18 +1,21 @@
 const http = require('http');
 const { Connection, PublicKey } = require('@solana/web3.js');
 const axios = require('axios');
+const rateLimit = require('axios-rate-limit');
+
+// Configure rate-limited axios instance
+const httpClient = rateLimit(axios.create(), {
+  maxRequests: 5,
+  perMilliseconds: 1000
+});
 
 // Configuration
 const RPC_URL = process.env.RPC_URL || 'https://api.mainnet-beta.solana.com';
 const WALLETS = process.env.WALLETS ? process.env.WALLETS.split(',') : [];
 const TG_TOKEN = process.env.TG_TOKEN;
 const TG_CHAT_ID = process.env.TG_CHAT_ID;
-const TEST_TOKEN = process.env.TEST_TOKEN || "default-secret";
 const CHECK_INTERVAL = process.env.CHECK_INTERVAL ? parseInt(process.env.CHECK_INTERVAL) : 5 * 60 * 1000; // 5 minutes
-
-// Token addresses
-const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
-const SOL_MINT = 'So11111111111111111111111111111111111111112';
+const SOL_PRICE_API = 'https://price.jup.ag/v4/price?ids=SOL';
 
 // Initialize Solana connection
 const connection = new Connection(RPC_URL, 'confirmed');
@@ -25,11 +28,13 @@ let solPrice = 0;
 // Helper functions
 async function fetchSOLPrice() {
   try {
-    const response = await axios.get('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
-    solPrice = response.data.solana.usd;
+    const response = await httpClient.get(SOL_PRICE_API);
+    solPrice = response.data.data.SOL.price;
     console.log(`Current SOL price: $${solPrice}`);
   } catch (error) {
     console.error("Error fetching SOL price:", error.message);
+    // Fallback price if API fails
+    solPrice = 20;
   }
 }
 
@@ -40,10 +45,11 @@ async function sendTelegramAlert(message) {
   }
 
   try {
-    await axios.post(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+    await httpClient.post(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
       chat_id: TG_CHAT_ID,
       text: message,
-      parse_mode: 'Markdown'
+      parse_mode: 'Markdown',
+      disable_web_page_preview: false
     });
   } catch (error) {
     console.error("Failed to send Telegram alert:", error.message);
@@ -53,31 +59,37 @@ async function sendTelegramAlert(message) {
 async function getTokenDetails(mintAddress) {
   try {
     // Try Jupiter API first
-    const jupResponse = await axios.get(`https://token.jup.ag/strict/${mintAddress}`);
-    if (jupResponse.data) {
-      return {
-        symbol: jupResponse.data.symbol,
-        name: jupResponse.data.name,
-        decimals: jupResponse.data.decimals,
-        logoURI: jupResponse.data.logoURI
-      };
-    }
-  } catch (jupError) {
-    // Fallback to Solana FM
+    const response = await httpClient.get(`https://token.jup.ag/strict/${mintAddress}`);
+    return {
+      address: mintAddress,
+      symbol: response.data.symbol,
+      name: response.data.name,
+      decimals: response.data.decimals,
+      logoURI: response.data.logoURI,
+      verified: true
+    };
+  } catch (error) {
+    // Fallback to on-chain data if Jupiter fails
     try {
-      const fmResponse = await axios.get(`https://api.solana.fm/v1/tokens/${mintAddress}`);
+      const accountInfo = await connection.getParsedAccountInfo(new PublicKey(mintAddress));
+      const details = accountInfo.value?.data?.parsed?.info;
+      
       return {
-        symbol: fmResponse.data.symbol || `UNKNOWN (${mintAddress.slice(0, 4)}..${mintAddress.slice(-4)})`,
-        name: fmResponse.data.name || 'Unknown Token',
-        decimals: fmResponse.data.decimals || 9,
-        logoURI: fmResponse.data.image || ''
+        address: mintAddress,
+        symbol: details?.symbol || `UNKNOWN (${shortAddress(mintAddress)})`,
+        name: details?.name || 'Unknown Token',
+        decimals: details?.decimals || 9,
+        logoURI: '',
+        verified: false
       };
-    } catch (fmError) {
+    } catch (e) {
       return {
-        symbol: `UNKNOWN (${mintAddress.slice(0, 4)}..${mintAddress.slice(-4)})`,
+        address: mintAddress,
+        symbol: `UNKNOWN (${shortAddress(mintAddress)})`,
         name: 'Unknown Token',
         decimals: 9,
-        logoURI: ''
+        logoURI: '',
+        verified: false
       };
     }
   }
@@ -87,18 +99,22 @@ async function checkWalletTransactions(wallet) {
   try {
     const pubkey = new PublicKey(wallet);
     const signatures = await connection.getSignaturesForAddress(pubkey, {
-      limit: 10
+      limit: 15
     });
 
     for (const { signature } of signatures) {
       if (processedTxs.has(signature)) continue;
       
-      const tx = await connection.getParsedTransaction(signature, {
-        maxSupportedTransactionVersion: 0
-      });
-      
-      await analyzeTransaction(tx, wallet);
-      processedTxs.add(signature);
+      try {
+        const tx = await connection.getParsedTransaction(signature, {
+          maxSupportedTransactionVersion: 0
+        });
+        
+        await analyzeTransaction(tx, wallet);
+        processedTxs.add(signature);
+      } catch (error) {
+        console.error(`Error processing tx ${signature}:`, error.message);
+      }
     }
   } catch (error) {
     console.error(`Error checking ${wallet}:`, error.message);
@@ -122,99 +138,119 @@ async function analyzeTransaction(tx, wallet) {
 }
 
 async function handleTokenTransfer(parsedIx, wallet, tx) {
-  const { mint, tokenAmount, destination } = parsedIx.info;
-  const amount = tokenAmount.uiAmount;
-  const { symbol, name, decimals, logoURI } = await getTokenDetails(mint);
-
-  // Calculate USD value
-  let usdValue = 0;
-  if (mint === USDC_MINT) {
-    usdValue = amount;
-  } else if (mint === SOL_MINT) {
-    usdValue = amount * solPrice;
-  } else {
-    // For other tokens, we'd need a price API - you can add this later
-    usdValue = 0;
-  }
-
-  // Check if this is an incoming transfer (purchase)
-  if (destination === wallet) {
-    const message = `🛒 Token Purchase Detected!\n` +
-                   `Wallet: ${shortAddress(wallet)}\n` +
-                   `Token: ${symbol} (${name})\n` +
-                   `Amount: ${amount.toFixed(decimals)} ${symbol}\n` +
-                   `Value: ${usdValue > 0 ? '$' + usdValue.toFixed(2) : 'Unknown'}\n` +
-                   `${logoURI ? `[Token Logo](${logoURI})` : ''}\n` +
-                   `[View Transaction](https://solscan.io/tx/${tx.transaction.signatures[0]})`;
+  try {
+    const { mint, tokenAmount, destination } = parsedIx.info;
     
-    await sendTelegramAlert(message);
+    // Skip if no token amount data
+    if (!tokenAmount || tokenAmount.uiAmount === undefined) return;
+    
+    const amount = tokenAmount.uiAmount;
+    const { address, symbol, name, decimals, logoURI, verified } = await getTokenDetails(mint);
 
-    // Track token purchases across wallets
-    if (!tokenPurchases[mint]) {
-      tokenPurchases[mint] = {
-        symbol,
-        wallets: new Set(),
-        count: 0
-      };
+    // Check if this is an incoming transfer (purchase)
+    if (destination === wallet) {
+      const message = `🛒 *Token Purchase Detected!*\n` +
+                     `▸ Wallet: \`${shortAddress(wallet)}\`\n` +
+                     `▸ Token: [${symbol} (${name})](${logoURI || `https://solscan.io/token/${address}`})\n` +
+                     `▸ Token Address: \`${address}\`\n` +
+                     `▸ Amount: ${amount.toFixed(decimals)} ${symbol}\n` +
+                     `▸ [View Transaction](https://solscan.io/tx/${tx.transaction.signatures[0]})` +
+                     `${!verified ? '\n⚠️ *Unverified Token* - Do your research!' : ''}`;
+      
+      await sendTelegramAlert(message);
+
+      // Track token purchases across wallets
+      if (!tokenPurchases[mint]) {
+        tokenPurchases[mint] = {
+          symbol,
+          name,
+          address,
+          wallets: new Set(),
+          count: 0
+        };
+      }
+
+      tokenPurchases[mint].wallets.add(wallet);
+      tokenPurchases[mint].count++;
+
+      // Alert if multiple wallets buying same token
+      if (tokenPurchases[mint].wallets.size >= 3) {
+        const coordMessage = `🚨 *Coordinated Buying Detected!*\n` +
+                            `▸ Token: [${symbol} (${name})](${logoURI || `https://solscan.io/token/${address}`})\n` +
+                            `▸ Token Address: \`${address}\`\n` +
+                            `▸ Wallets: ${tokenPurchases[mint].wallets.size}\n` +
+                            `▸ Total Purchases: ${tokenPurchases[mint].count}\n` +
+                            `▸ [View Token](https://solscan.io/token/${address})` +
+                            `${!verified ? '\n⚠️ *Unverified Token* - Exercise caution!' : ''}`;
+        await sendTelegramAlert(coordMessage);
+        tokenPurchases[mint].wallets.clear();
+        tokenPurchases[mint].count = 0;
+      }
     }
-
-    tokenPurchases[mint].wallets.add(wallet);
-    tokenPurchases[mint].count++;
-
-    // Alert if multiple wallets buying same token
-    if (tokenPurchases[mint].wallets.size >= 3) {
-      const coordMessage = `🚨 Coordinated Buying Detected!\n` +
-                          `Token: ${symbol} (${name})\n` +
-                          `Wallets: ${tokenPurchases[mint].wallets.size}\n` +
-                          `Total Purchases: ${tokenPurchases[mint].count}\n` +
-                          `${logoURI ? `[Token Logo](${logoURI})` : ''}`;
-      await sendTelegramAlert(coordMessage);
-      tokenPurchases[mint].wallets.clear();
-      tokenPurchases[mint].count = 0;
-    }
+  } catch (error) {
+    console.error('Error in handleTokenTransfer:', error);
   }
 }
 
 async function detectSwaps(tx, wallet) {
-  const preBalances = tx.meta.preTokenBalances;
-  const postBalances = tx.meta.postTokenBalances;
+  try {
+    const preBalances = tx.meta.preTokenBalances;
+    const postBalances = tx.meta.postTokenBalances;
 
-  // Find token balance changes
-  const changes = {};
-  for (const balance of postBalances) {
-    const pre = preBalances.find(b => b.mint === balance.mint && b.owner === balance.owner);
-    const preAmount = pre?.uiTokenAmount.uiAmount || 0;
-    const postAmount = balance.uiTokenAmount.uiAmount;
-    const diff = postAmount - preAmount;
+    // Find token balance changes
+    const changes = {};
+    for (const balance of postBalances) {
+      if (balance.owner !== wallet) continue;
+      
+      const pre = preBalances.find(b => b.mint === balance.mint && b.owner === balance.owner);
+      const preAmount = pre?.uiTokenAmount?.uiAmount || 0;
+      const postAmount = balance.uiTokenAmount?.uiAmount || 0;
+      const diff = postAmount - preAmount;
 
-    if (Math.abs(diff) > 0) {
-      const { symbol, name, decimals, logoURI } = await getTokenDetails(balance.mint);
-      changes[balance.mint] = {
-        symbol,
-        name,
-        change: diff,
-        decimals,
-        logoURI
-      };
+      if (Math.abs(diff) > 0) {
+        const { address, symbol, name, decimals, logoURI, verified } = await getTokenDetails(balance.mint);
+        changes[balance.mint] = {
+          address,
+          symbol,
+          name,
+          change: diff,
+          decimals,
+          logoURI,
+          verified
+        };
+      }
     }
-  }
 
-  // Check if this was a swap (one token in, another out)
-  const changedTokens = Object.keys(changes);
-  if (changedTokens.length === 2) {
-    const [tokenIn, tokenOut] = Object.values(changes);
-    
-    // Only alert if significant swap
-    if (Math.abs(tokenIn.change) > 10 || Math.abs(tokenOut.change) > 10) {
-      const message = `🔀 Swap Detected!\n` +
-                     `Wallet: ${shortAddress(wallet)}\n` +
-                     `Sold: ${Math.abs(tokenIn.change).toFixed(tokenIn.decimals)} ${tokenIn.symbol}\n` +
-                     `Bought: ${Math.abs(tokenOut.change).toFixed(tokenOut.decimals)} ${tokenOut.symbol}\n` +
-                     `${tokenOut.logoURI ? `[Token Logo](${tokenOut.logoURI})` : ''}\n` +
-                     `[View Transaction](https://solscan.io/tx/${tx.transaction.signatures[0]})`;
+    // Check if this was a swap (one token in, another out)
+    const changedTokens = Object.keys(changes);
+    if (changedTokens.length === 2) {
+      const [tokenA, tokenB] = Object.values(changes);
+      let tokenIn, tokenOut;
+      
+      // Determine which token was bought vs sold
+      if (tokenA.change > 0 && tokenB.change < 0) {
+        tokenOut = tokenA;
+        tokenIn = tokenB;
+      } else if (tokenA.change < 0 && tokenB.change > 0) {
+        tokenOut = tokenB;
+        tokenIn = tokenA;
+      } else {
+        return; // Not a clean swap
+      }
+
+      const message = `🔀 *Swap Detected!*\n` +
+                     `▸ Wallet: \`${shortAddress(wallet)}\`\n` +
+                     `▸ Sold: ${Math.abs(tokenIn.change).toFixed(tokenIn.decimals)} ${tokenIn.symbol}\n` +
+                     `▸ Bought: ${Math.abs(tokenOut.change).toFixed(tokenOut.decimals)} ${tokenOut.symbol}\n` +
+                     `▸ Token Address: \`${tokenOut.address}\`\n` +
+                     `▸ Token: [${tokenOut.symbol} (${tokenOut.name})](${tokenOut.logoURI || `https://solscan.io/token/${tokenOut.address}`})\n` +
+                     `▸ [View Transaction](https://solscan.io/tx/${tx.transaction.signatures[0]})` +
+                     `${!tokenOut.verified ? '\n⚠️ *Unverified Token* - Research before trading!' : ''}`;
       
       await sendTelegramAlert(message);
     }
+  } catch (error) {
+    console.error('Error in detectSwaps:', error);
   }
 }
 
