@@ -128,7 +128,26 @@ async function checkWallets() {
 // ======================
 // SERVEUR HTTP
 // ======================
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
+  // Nouvelle route pour les tests manuels
+  if (req.method === 'POST' && req.url === '/trigger-alert') {
+    try {
+      const testMint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"; // USDC exemple
+      await sendTelegramAlert(testMint, {
+        count: 3,
+        wallets: ["7o1UnD...", "HSQEzV...", "GDKVNs..."],
+        amount: 45.67
+      });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ status: "Test alert sent" }));
+    } catch (error) {
+      res.writeHead(500);
+      res.end("Error sending test alert");
+    }
+    return;
+  }
+
+  // Route existante (keep this)
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({
     status: 'running',
@@ -137,9 +156,5 @@ const server = http.createServer((req, res) => {
   }));
 }).listen(process.env.PORT || 3000, () => {
   console.log(`🌐 Server running on port ${process.env.PORT || 3000}`);
-  console.log(`⏳ Starting initial scan...`);
-  
-  // Premier scan immédiat puis toutes les 30 min
-  checkWallets();
-  setInterval(checkWallets, 30 * 60 * 1000);
+  // ... (votre code existant)
 });
