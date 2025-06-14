@@ -2,55 +2,73 @@ const { Connection, PublicKey } = require('@solana/web3.js');
 const axios = require('axios');
 
 // Config
-const RPC_URL = process.env.RPC_URL;
-const WALLETS = process.env.WALLETS.split(',');
-const TG_TOKEN = process.env.TG_TOKEN;
-const TG_CHAT_ID = process.env.TG_CHAT_ID;
-const connection = new Connection(RPC_URL, {
-  commitment: 'confirmed',
-  httpHeaders: { 'maxSupportedTransactionVersion': 0 }
-});
+const MIN_SOL_AMOUNT = 10; // Filtre les TX > 10 SOL
+const MIN_WALLETS = 3; // Alerte si 3+ wallets achètent le même token
+const connection = new Connection(process.env.RPC_URL, "confirmed");
 
-// Envoi d'alerte Telegram
-async function sendAlert(wallet, tx) {
-  const msg = `🔄 *Nouvelle TX Solana* \n\n` +
-             `👛 Wallet: \`${wallet.substring(0, 6)}...\`\n` +
-             `📊 Montant: ${tx.amount || '?'} SOL\n` +
-             `🔗 [Voir TX](https://solscan.io/tx/${tx.signature})`;
-  
-  try {
-    await axios.post(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
-      chat_id: TG_CHAT_ID,
-      text: msg,
-      parse_mode: 'Markdown',
-      disable_web_page_preview: true
-    });
-  } catch (error) {
-    console.error('Erreur Telegram:', error.message);
-  }
+// Dictionnaire pour tracker les tokens
+const tokenTracker = {};
+
+async function analyzeTransaction(signature, wallet) {
+  const tx = await connection.getParsedTransaction(signature);
+  if (!tx) return null;
+
+  const transfers = tx.transaction.message.instructions
+    .filter(ix => ix.programId?.equals(new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")))
+    .map(ix => ({
+      mint: ix.parsed?.info?.mint,
+      amount: ix.parsed?.info?.amount / 1e9, // Converti en SOL
+      wallet
+    }))
+    .filter(t => t.amount > MIN_SOL_AMOUNT); // Filtre les gros montants
+
+  return transfers.length ? transfers[0] : null;
 }
 
-async function trackWallet(wallet) {
-  try {
-    const pubKey = new PublicKey(wallet);
-    const txs = await connection.getSignaturesForAddress(pubKey, { limit: 3 });
+async function checkWallets() {
+  const wallets = process.env.WALLETS.split(',');
+  
+  for (const wallet of wallets) {
+    const txs = await connection.getSignaturesForAddress(new PublicKey(wallet), { limit: 5 });
     
     for (const tx of txs) {
-      await sendAlert(wallet, {
-        signature: tx.signature,
-        amount: (tx.amount / 1e9).toFixed(2) // Conversion en SOL
-      });
+      const transfer = await analyzeTransaction(tx.signature, wallet);
+      if (!transfer) continue;
+
+      if (!tokenTracker[transfer.mint]) {
+        tokenTracker[transfer.mint] = {
+          count: 1,
+          wallets: [wallet],
+          amount: transfer.amount
+        };
+      } else {
+        tokenTracker[transfer.mint].count += 1;
+        tokenTracker[transfer.mint].wallets.push(wallet);
+        tokenTracker[transfer.mint].amount += transfer.amount;
+      }
+
+      // Alerte si seuil atteint
+      if (tokenTracker[transfer.mint].count === MIN_WALLETS) {
+        await sendTelegramAlert(transfer.mint, tokenTracker[transfer.mint]);
+      }
     }
-  } catch (error) {
-    console.error(`❌ Erreur sur ${wallet.substring(0, 6)}:`, error.message);
   }
 }
 
-// Exécution
-async function run() {
-  console.log(`Début du scan (${WALLETS.length} wallets)...`);
-  await Promise.all(WALLETS.map(trackWallet));
-  setTimeout(run, 6 * 60 * 60 * 1000); // Toutes les 6h
+async function sendTelegramAlert(mint, data) {
+  const tokenName = await fetchTokenName(mint); // À implémenter
+  const msg = `🚨 *Achat groupé détecté!*\n\n` +
+             `🪙 Token: ${tokenName || mint}\n` +
+             `👛 Wallets: ${data.count} (${data.wallets.slice(0, 3).map(w => w.substring(0, 6))}...)\n` +
+             `💰 Montant total: ${data.amount.toFixed(2)} SOL\n` +
+             `🔍 [Voir token](https://solscan.io/token/${mint})`;
+
+  await axios.post(`https://api.telegram.org/bot${process.env.TG_TOKEN}/sendMessage`, {
+    chat_id: process.env.TG_CHAT_ID,
+    text: msg,
+    parse_mode: 'Markdown'
+  });
 }
 
-run();
+// À exécuter périodiquement
+setInterval(checkWallets, 30 * 60 * 1000); // Toutes les 30 min
