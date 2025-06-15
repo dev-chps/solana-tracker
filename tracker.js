@@ -1,6 +1,7 @@
 const http = require('http');
 const axios = require('axios');
 const { Connection, PublicKey } = require('@solana/web3.js');
+const NodeCache = require('node-cache');
 
 // ======================
 // 1. CONFIGURATION
@@ -11,10 +12,12 @@ const TG_TOKEN = process.env.TG_TOKEN;
 const TG_CHAT_ID = process.env.TG_CHAT_ID;
 const CHECK_INTERVAL = process.env.CHECK_INTERVAL || 5 * 60 * 1000; // 5 minutes
 let MIN_SWAP_VALUE = process.env.MIN_SWAP_VALUE ? parseInt(process.env.MIN_SWAP_VALUE) : 5000; // $5000 default
+const RATE_LIMIT_DELAY = process.env.RATE_LIMIT_DELAY || 1000; // 1 second between requests
 
 // ======================
-// 2. RATE LIMITING SYSTEM
+// 2. CACHE & RATE LIMITING
 // ======================
+const requestCache = new NodeCache({ stdTTL: 300 }); // 5 minute cache
 const requestQueue = [];
 let isProcessing = false;
 
@@ -24,16 +27,34 @@ async function processQueue() {
 
   const { url, resolve, reject } = requestQueue.shift();
   try {
-    const response = await axios.get(url, { timeout: 2000 });
-    resolve(response);
+    const cached = requestCache.get(url);
+    if (cached) {
+      resolve(cached);
+    } else {
+      const response = await axios.get(url, { 
+        timeout: 2000,
+        headers: { 'User-Agent': 'SolanaTracker/2.0.0' }
+      });
+      requestCache.set(url, response);
+      resolve(response);
+    }
   } catch (error) {
+    if (error.response?.status === 429) {
+      // Requeue with delay
+      requestQueue.unshift({ url, resolve, reject });
+      setTimeout(() => {
+        isProcessing = false;
+        processQueue();
+      }, 1000);
+      return;
+    }
     reject(error);
   }
 
   setTimeout(() => {
     isProcessing = false;
     processQueue();
-  }, 1000); // 1 request/second
+  }, RATE_LIMIT_DELAY);
 }
 
 function rateLimitedRequest(url) {
@@ -44,7 +65,7 @@ function rateLimitedRequest(url) {
 }
 
 // ======================
-// 3. ENHANCED PRICE SERVICE
+// 3. PRICE SERVICE
 // ======================
 class PriceService {
   constructor() {
@@ -59,30 +80,29 @@ class PriceService {
 
   async loadScamList() {
     try {
-      const response = await rateLimitedRequest('https://raw.githubusercontent.com/solana-labs/token-list/main/assets/mainnet/known-scams.json');
-      response.data.forEach(token => this.knownScams.add(token.address));
+      const response = await rateLimitedRequest('https://raw.githubusercontent.com/solana-labs/token-list/main/src/tokens/solana.tokenlist.json');
+      const scamTokens = response.data.tokens.filter(token => token.extensions?.isScam);
+      scamTokens.forEach(token => this.knownScams.add(token.address));
     } catch (error) {
       console.error('Failed to load scam list:', error.message);
     }
   }
 
   async getTokenDetails(mintAddress) {
-    // Handle blue-chip tokens
     if (this.blueChips.has(mintAddress)) {
       return {
         address: mintAddress,
-        symbol: mintAddress === 'So11111111111111111111111111111111111111111112' ? 'SOL' : 'USDC',
-        name: mintAddress === 'So11111111111111111111111111111111111111111112' ? 'Solana' : 'USD Coin',
-        decimals: 9,
+        symbol: mintAddress === 'So11111111111111111111111111111111111111112' ? 'SOL' : 'USDC',
+        name: mintAddress === 'So11111111111111111111111111111111111111112' ? 'Solana' : 'USD Coin',
+        decimals: mintAddress === 'So11111111111111111111111111111111111111112' ? 9 : 6,
         isBlueChip: true,
         isScam: false,
-        logoURI: mintAddress === 'So11111111111111111111111111111111111111111112' 
+        logoURI: mintAddress === 'So11111111111111111111111111111111111111112' 
           ? 'https://raw.githubusercontent.com/solana-labs/token-list/main/assets/mainnet/So11111111111111111111111111111111111111112/logo.png'
           : 'https://raw.githubusercontent.com/solana-labs/token-list/main/assets/mainnet/EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v/logo.png'
       };
     }
 
-    // Check scam list
     if (this.knownScams.has(mintAddress)) {
       return {
         address: mintAddress,
@@ -94,7 +114,6 @@ class PriceService {
       };
     }
 
-    // Fetch token details
     try {
       const response = await rateLimitedRequest(`https://token.jup.ag/strict/${mintAddress}`);
       return {
@@ -123,7 +142,7 @@ class PriceService {
   async getPrice(mintAddress) {
     const cacheKey = mintAddress === 'So11111111111111111111111111111111111111112' ? 'SOL' : mintAddress;
     const cached = this.cache.get(cacheKey);
-    if (cached && Date.now() - cached.timestamp < 300000) { // 5 minute cache
+    if (cached && Date.now() - cached.timestamp < 300000) {
       return cached.price;
     }
 
@@ -183,7 +202,12 @@ async function sendTelegramAlert(message) {
 // ======================
 // 5. CORE TRACKING LOGIC
 // ======================
-const connection = new Connection(RPC_URL, 'confirmed');
+const connection = new Connection(RPC_URL, {
+  commitment: 'confirmed',
+  wsEndpoint: RPC_URL.replace('https://', 'wss://'),
+  httpHeaders: { 'Content-Type': 'application/json' }
+});
+
 const processedTxs = new Set();
 const dailyTokenStats = {};
 const alertedTokens = new Set();
@@ -208,7 +232,6 @@ async function detectSwaps(tx, wallet) {
     const postBalances = tx.meta.postTokenBalances || [];
     const changes = {};
 
-    // Analyze balance changes
     for (const balance of postBalances) {
       if (balance.owner !== wallet) continue;
       
@@ -225,17 +248,14 @@ async function detectSwaps(tx, wallet) {
       }
     }
 
-    // Validate swap pair
     const changedTokens = Object.keys(changes);
     if (changedTokens.length !== 2) return;
 
-    // Get prices
     const [tokenA, tokenB] = await Promise.all([
       { ...changes[changedTokens[0]], price: await priceService.getPrice(changedTokens[0]) },
       { ...changes[changedTokens[1]], price: await priceService.getPrice(changedTokens[1]) }
     ]);
 
-    // Determine swap direction
     let tokenIn, tokenOut, usdValue;
     if (tokenA.change > 0 && tokenB.change < 0) {
       tokenOut = tokenA;
@@ -249,14 +269,11 @@ async function detectSwaps(tx, wallet) {
       return;
     }
 
-    // Apply threshold
     if (usdValue < MIN_SWAP_VALUE) return;
 
-    // Check liquidity
     const liquidity = await checkLiquidity(tokenOut.address);
     const liquidityWarning = liquidity < usdValue * 10 ? `\n⚠️ LOW LIQUIDITY ($${liquidity.toFixed(2)})` : '';
 
-    // Prepare alert
     const message = `💎 *Large Swap Detected* ($${usdValue.toFixed(2)})${liquidityWarning}\n` +
                    `▸ Wallet: \`${shortAddress(wallet)}\`\n` +
                    `▸ Sold: ${Math.abs(tokenIn.change).toFixed(tokenIn.decimals)} ${tokenIn.symbol}\n` +
@@ -287,7 +304,6 @@ async function handleTokenTransfer(parsedIx, wallet, tx) {
       lastPrice: null
     };
 
-    // Update stats
     tokenData.wallets.add(wallet);
     tokenData.totalAmount += tokenAmount.uiAmount;
     const currentPrice = await priceService.getPrice(mint);
@@ -295,7 +311,6 @@ async function handleTokenTransfer(parsedIx, wallet, tx) {
     tokenData.firstPrice = tokenData.firstPrice || currentPrice;
     dailyTokenStats[today][mint] = tokenData;
 
-    // Check for coordinated buying
     if (tokenData.wallets.size >= 3 && !alertedTokens.has(mint)) {
       const priceChange = tokenData.firstPrice 
         ? ((tokenData.lastPrice - tokenData.firstPrice) / tokenData.firstPrice * 100).toFixed(2)
@@ -316,20 +331,15 @@ async function handleTokenTransfer(parsedIx, wallet, tx) {
   }
 }
 
-// ======================
-// 6. TRANSACTION PROCESSING
-// ======================
 async function analyzeTransaction(tx, wallet) {
   if (!tx?.transaction?.message?.instructions) return;
 
-  // Check transfers
   for (const ix of tx.transaction.message.instructions) {
     if (ix.parsed?.type === 'transfer' || ix.parsed?.type === 'transferChecked') {
       await handleTokenTransfer(ix.parsed, wallet, tx);
     }
   }
 
-  // Check swaps
   if (tx.meta?.preTokenBalances && tx.meta?.postTokenBalances) {
     await detectSwaps(tx, wallet);
   }
@@ -338,13 +348,24 @@ async function analyzeTransaction(tx, wallet) {
 async function checkWalletTransactions(wallet) {
   try {
     const pubkey = new PublicKey(wallet);
-    const signatures = await connection.getSignaturesForAddress(pubkey, { limit: 15 });
+    const signatures = await connection.getSignaturesForAddress(pubkey, { 
+      limit: 15,
+      maxSupportedTransactionVersion: 0
+    });
 
     for (const { signature } of signatures) {
       if (!processedTxs.has(signature)) {
-        const tx = await connection.getParsedTransaction(signature);
-        await analyzeTransaction(tx, wallet);
-        processedTxs.add(signature);
+        try {
+          const tx = await connection.getParsedTransaction(signature, {
+            maxSupportedTransactionVersion: 0
+          });
+          if (tx) {
+            await analyzeTransaction(tx, wallet);
+            processedTxs.add(signature);
+          }
+        } catch (txError) {
+          console.error(`Transaction processing error (${signature}):`, txError.message);
+        }
       }
     }
   } catch (error) {
@@ -361,7 +382,7 @@ async function checkWallets() {
 }
 
 // ======================
-// 7. CLEANUP & MAINTENANCE
+// 6. CLEANUP & SERVER
 // ======================
 function getYesterdayDate() {
   const date = new Date();
@@ -377,11 +398,8 @@ setInterval(() => {
     }
   });
   alertedTokens.clear();
-}, 6 * 60 * 60 * 1000); // Clean every 6 hours
+}, 6 * 60 * 60 * 1000);
 
-// ======================
-// 8. SERVER INITIALIZATION
-// ======================
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ 
@@ -393,5 +411,5 @@ const server = http.createServer((req, res) => {
 }).listen(process.env.PORT || 10000, () => {
   console.log(`Server running on port ${process.env.PORT || 10000}`);
   setInterval(checkWallets, CHECK_INTERVAL);
-  checkWallets(); // Initial run
+  checkWallets();
 });
