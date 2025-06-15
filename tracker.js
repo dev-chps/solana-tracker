@@ -1,10 +1,7 @@
 const http = require('http');
 const { Connection, PublicKey } = require('@solana/web3.js');
 const axios = require('axios');
-axios.interceptors.request.use(async (config) => {
-  await new Promise(resolve => setTimeout(resolve, 1000)); // 1 second delay
-  return config;
-});
+
 
 // Configure rate-limited axios instance
 const httpClient = rateLimit(axios.create(), {
