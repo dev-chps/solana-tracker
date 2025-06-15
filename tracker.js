@@ -77,6 +77,11 @@ class PriceService {
 }
 
 const priceService = new PriceService();
+/ ======================
+// 2. COORDINATED BUY TRACKING (NEW)
+// ======================
+const dailyTokenStats = {}; // Tracks buys per token per day
+const alertedTokens = new Set(); // Prevents duplicate alerts
 
 // ======================
 // 2. CONFIGURATION
@@ -234,7 +239,7 @@ async function detectSwaps(tx, wallet) {
     await sendTelegramAlert(message);
 
   } catch (error) {
-    console.error('Swap detection error:', error.message);
+    console.error('Swap detection error:', error);
   }
 }
 
@@ -287,19 +292,56 @@ async function handleTokenTransfer(parsedIx, wallet, tx) {
     const { mint, tokenAmount, destination } = parsedIx.info;
     if (destination !== wallet || !tokenAmount?.uiAmount) return;
 
-    const tokenInfo = await getTokenDetails(mint);
-    const message = `🛒 *Token Received*\n` +
-                   `▸ Wallet: \`${shortAddress(wallet)}\`\n` +
-                   `▸ Amount: ${tokenAmount.uiAmount.toFixed(tokenInfo.decimals)} ${tokenInfo.symbol}\n` +
-                   `▸ [Transaction](https://solscan.io/tx/${tx.transaction.signatures[0]})` +
-                   `${!tokenInfo.verified ? '\n⚠️ *Unverified Token*' : ''}`;
+    // Get current date (YYYY-MM-DD format)
+    const today = new Date().toISOString().split('T')[0];
+    
+    // Initialize daily tracking
+    if (!dailyTokenStats[today]) dailyTokenStats[today] = {};
+    if (!dailyTokenStats[today][mint]) {
+      const tokenInfo = await getTokenDetails(mint);
+      dailyTokenStats[today][mint] = {
+        ...tokenInfo,
+        wallets: new Set(),
+        totalAmount: 0,
+        firstPrice: null,
+        lastPrice: null
+      };
+    }
 
-    await sendTelegramAlert(message);
+    const tokenData = dailyTokenStats[today][mint];
+    
+    // Update stats
+    tokenData.wallets.add(wallet);
+    tokenData.totalAmount += tokenAmount.uiAmount;
+    
+    // Get current price
+    const currentPrice = await priceService.getPrice(mint);
+    tokenData.lastPrice = currentPrice;
+    if (!tokenData.firstPrice) tokenData.firstPrice = currentPrice;
+
+    // Check for 3+ unique wallet buys (NEW COORDINATED BUY DETECTION)
+    if (tokenData.wallets.size >= 3 && !alertedTokens.has(mint)) {
+      const priceChange = tokenData.firstPrice 
+        ? ((tokenData.lastPrice - tokenData.firstPrice) / tokenData.firstPrice * 100).toFixed(2)
+        : 0;
+
+      const message = `🚨 *Coordinated Buying!* (${tokenData.wallets.size} wallets)\n` +
+                     `▸ Token: ${tokenData.symbol} (${tokenData.name})\n` +
+                     `▸ Address: \`${shortAddress(mint)}\`\n` +
+                     `▸ Volume: ${tokenData.totalAmount.toFixed(tokenData.decimals)} ${tokenData.symbol}\n` +
+                     `▸ Price Change: ${priceChange}%\n` +
+                     `▸ [DexScreener](https://dexscreener.com/solana/${mint})\n` +
+                     `${!tokenData.verified ? '⚠️ *Unverified* - DYOR!' : ''}`;
+
+      await sendTelegramAlert(message);
+      alertedTokens.add(mint); // Prevent duplicate alerts
+    }
 
   } catch (error) {
-    console.error('Transfer handling error:', error.message);
+    console.error('Transfer handling error:', error);
   }
 }
+
 
 // ======================
 // 6. MAIN SERVER
@@ -326,3 +368,23 @@ const server = http.createServer((req, res) => {
   checkWallets();
   setInterval(checkWallets, CHECK_INTERVAL);
 });
+setInterval(() => {
+  const today = new Date().toISOString().split('T')[0];
+  
+  // Remove old data (>48 hours)
+  Object.keys(dailyTokenStats).forEach(date => {
+    if (date !== today && date !== getYesterdayDate()) {
+      delete dailyTokenStats[date];
+    }
+  });
+
+  // Reset alerted tokens daily
+  alertedTokens.clear();
+  
+}, 6 * 60 * 60 * 1000); // Runs every 6 hours
+
+function getYesterdayDate() {
+  const date = new Date();
+  date.setDate(date.getDate() - 1);
+  return date.toISOString().split('T')[0];
+}
