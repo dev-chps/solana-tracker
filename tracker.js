@@ -91,8 +91,6 @@ async function getTokenDetails(mintAddress) {
   }
 }
 
-
-// Only change needed is to replace ALL httpClient with axios
 async function checkWalletTransactions(wallet) {
   try {
     const pubkey = new PublicKey(wallet);
@@ -122,14 +120,12 @@ async function checkWalletTransactions(wallet) {
 async function analyzeTransaction(tx, wallet) {
   if (!tx?.transaction?.message?.instructions) return;
 
-  // Check for token transfers
   for (const ix of tx.transaction.message.instructions) {
     if (ix.parsed?.type === 'transfer' || ix.parsed?.type === 'transferChecked') {
       await handleTokenTransfer(ix.parsed, wallet, tx);
     }
   }
 
-  // Check for swaps
   if (tx.meta?.preTokenBalances && tx.meta?.postTokenBalances) {
     await detectSwaps(tx, wallet);
   }
@@ -139,13 +135,11 @@ async function handleTokenTransfer(parsedIx, wallet, tx) {
   try {
     const { mint, tokenAmount, destination } = parsedIx.info;
     
-    // Skip if no token amount data
     if (!tokenAmount || tokenAmount.uiAmount === undefined) return;
     
     const amount = tokenAmount.uiAmount;
     const { address, symbol, name, decimals, logoURI, verified } = await getTokenDetails(mint);
 
-    // Check if this is an incoming transfer (purchase)
     if (destination === wallet) {
       const message = `🛒 *Token Purchase Detected!*\n` +
                      `▸ Wallet: \`${shortAddress(wallet)}\`\n` +
@@ -157,7 +151,6 @@ async function handleTokenTransfer(parsedIx, wallet, tx) {
       
       await sendTelegramAlert(message);
 
-      // Track token purchases across wallets
       if (!tokenPurchases[mint]) {
         tokenPurchases[mint] = {
           symbol,
@@ -171,7 +164,6 @@ async function handleTokenTransfer(parsedIx, wallet, tx) {
       tokenPurchases[mint].wallets.add(wallet);
       tokenPurchases[mint].count++;
 
-      // Alert if multiple wallets buying same token
       if (tokenPurchases[mint].wallets.size >= 3) {
         const coordMessage = `🚨 *Coordinated Buying Detected!*\n` +
                             `▸ Token: [${symbol} (${name})](${logoURI || `https://solscan.io/token/${address}`})\n` +
@@ -194,9 +186,8 @@ async function detectSwaps(tx, wallet) {
   try {
     const preBalances = tx.meta.preTokenBalances;
     const postBalances = tx.meta.postTokenBalances;
-
-    // Find token balance changes
     const changes = {};
+    
     for (const balance of postBalances) {
       if (balance.owner !== wallet) continue;
       
@@ -219,13 +210,11 @@ async function detectSwaps(tx, wallet) {
       }
     }
 
-    // Check if this was a swap (one token in, another out)
     const changedTokens = Object.keys(changes);
     if (changedTokens.length === 2) {
       const [tokenA, tokenB] = Object.values(changes);
       let tokenIn, tokenOut;
       
-      // Determine which token was bought vs sold
       if (tokenA.change > 0 && tokenB.change < 0) {
         tokenOut = tokenA;
         tokenIn = tokenB;
@@ -233,7 +222,7 @@ async function detectSwaps(tx, wallet) {
         tokenOut = tokenB;
         tokenIn = tokenA;
       } else {
-        return; // Not a clean swap
+        return;
       }
 
       const message = `🔀 *Swap Detected!*\n` +
@@ -255,6 +244,10 @@ async function detectSwaps(tx, wallet) {
 function shortAddress(address, chars = 4) {
   return `${address.slice(0, chars)}...${address.slice(-chars)}`;
 }
+
+// Trackers
+const tokenPurchases = {};
+const processedTxs = new Set();
 
 // Main function
 async function checkWallets() {
