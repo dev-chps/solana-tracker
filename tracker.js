@@ -2,46 +2,37 @@ const http = require('http');
 const axios = require('axios');
 const { Connection, PublicKey } = require('@solana/web3.js');
 
-// Simple but effective rate limiting
-let lastCallTime = 0;
+// 1. Rate Limiting Setup
+let lastRequestTime = 0;
 axios.interceptors.request.use(async (config) => {
   const now = Date.now();
-  const delay = Math.max(0, 1000 - (now - lastCallTime)); // 1 second between requests
+  const delay = Math.max(0, 1000 - (now - lastRequestTime));
   await new Promise(resolve => setTimeout(resolve, delay));
-  lastCallTime = now;
+  lastRequestTime = now;
   return config;
 });
 
-// Rest of your existing tracker code below...
-// (Keep all your wallet tracking logic here)
-
-
-// Configuration
+// 2. Configuration
 const RPC_URL = process.env.RPC_URL || 'https://api.mainnet-beta.solana.com';
 const WALLETS = process.env.WALLETS ? process.env.WALLETS.split(',') : [];
 const TG_TOKEN = process.env.TG_TOKEN;
 const TG_CHAT_ID = process.env.TG_CHAT_ID;
-const CHECK_INTERVAL = process.env.CHECK_INTERVAL ? parseInt(process.env.CHECK_INTERVAL) : 5 * 60 * 1000; // 5 minutes
-const SOL_PRICE_API = 'https://price.jup.ag/v4/price?ids=SOL';
+const CHECK_INTERVAL = process.env.CHECK_INTERVAL || 5 * 60 * 1000; // 5 minutes
+const SOL_PRICE_API = 'https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd';
 
-// Initialize Solana connection
+// 3. Initialize Connection
 const connection = new Connection(RPC_URL, 'confirmed');
-
-// Trackers
-const tokenPurchases = {};
-const processedTxs = new Set();
 let solPrice = 0;
 
-// Helper functions
+// 4. Helper Functions
 async function fetchSOLPrice() {
   try {
-    const response = await httpClient.get(SOL_PRICE_API);
-    solPrice = response.data.data.SOL.price;
+    const response = await axios.get(SOL_PRICE_API);
+    solPrice = response.data.solana.usd;
     console.log(`Current SOL price: $${solPrice}`);
   } catch (error) {
     console.error("Error fetching SOL price:", error.message);
-    // Fallback price if API fails
-    solPrice = 20;
+    solPrice = 20; // Fallback price
   }
 }
 
@@ -52,7 +43,7 @@ async function sendTelegramAlert(message) {
   }
 
   try {
-    await httpClient.post(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+    await axios.post(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
       chat_id: TG_CHAT_ID,
       text: message,
       parse_mode: 'Markdown',
@@ -65,8 +56,7 @@ async function sendTelegramAlert(message) {
 
 async function getTokenDetails(mintAddress) {
   try {
-    // Try Jupiter API first
-    const response = await httpClient.get(`https://token.jup.ag/strict/${mintAddress}`);
+    const response = await axios.get(`https://token.jup.ag/strict/${mintAddress}`);
     return {
       address: mintAddress,
       symbol: response.data.symbol,
@@ -76,7 +66,6 @@ async function getTokenDetails(mintAddress) {
       verified: true
     };
   } catch (error) {
-    // Fallback to on-chain data if Jupiter fails
     try {
       const accountInfo = await connection.getParsedAccountInfo(new PublicKey(mintAddress));
       const details = accountInfo.value?.data?.parsed?.info;
@@ -102,6 +91,8 @@ async function getTokenDetails(mintAddress) {
   }
 }
 
+
+// Only change needed is to replace ALL httpClient with axios
 async function checkWalletTransactions(wallet) {
   try {
     const pubkey = new PublicKey(wallet);
