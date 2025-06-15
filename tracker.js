@@ -1,3 +1,4 @@
+const dailyTokenPurchases = {};
 const http = require('http');
 const axios = require('axios');
 const { Connection, PublicKey } = require('@solana/web3.js');
@@ -130,58 +131,86 @@ async function analyzeTransaction(tx, wallet) {
     await detectSwaps(tx, wallet);
   }
 }
+//begin new change 
 
+// Modified handleTokenTransfer function
 async function handleTokenTransfer(parsedIx, wallet, tx) {
   try {
     const { mint, tokenAmount, destination } = parsedIx.info;
-    
-    if (!tokenAmount || tokenAmount.uiAmount === undefined) return;
-    
+    if (destination !== wallet || !tokenAmount?.uiAmount) return;
+
     const amount = tokenAmount.uiAmount;
     const { address, symbol, name, decimals, logoURI, verified } = await getTokenDetails(mint);
+    const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
 
-    if (destination === wallet) {
-      const message = `🛒 *Token Purchase Detected!*\n` +
-                     `▸ Wallet: \`${shortAddress(wallet)}\`\n` +
+    // Initialize daily tracking for this token
+    if (!dailyTokenPurchases[today]) dailyTokenPurchases[today] = {};
+    if (!dailyTokenPurchases[today][mint]) {
+      dailyTokenPurchases[today][mint] = {
+        symbol,
+        name,
+        address,
+        wallets: new Set(),
+        totalAmount: 0,
+        firstPrice: null,
+        lastPrice: null,
+        transactions: []
+      };
+    }
+
+    const tokenData = dailyTokenPurchases[today][mint];
+    
+    // Record transaction
+    tokenData.wallets.add(wallet);
+    tokenData.totalAmount += amount;
+    tokenData.transactions.push({
+      wallet: shortAddress(wallet),
+      amount,
+      timestamp: new Date().toISOString()
+    });
+
+    // Get token price (you'll need to implement this)
+    const currentPrice = await getTokenPrice(mint); 
+    if (!tokenData.firstPrice) tokenData.firstPrice = currentPrice;
+    tokenData.lastPrice = currentPrice;
+
+    // Check if we should alert (3+ unique wallets)
+    if (tokenData.wallets.size >= 3) {
+      const priceChange = tokenData.firstPrice 
+        ? ((tokenData.lastPrice - tokenData.firstPrice) / tokenData.firstPrice * 100).toFixed(2)
+        : 0;
+
+      const message = `🚨 *Potential Gem Alert!* 🚨\n` +
                      `▸ Token: [${symbol} (${name})](${logoURI || `https://solscan.io/token/${address}`})\n` +
-                     `▸ Token Address: \`${address}\`\n` +
-                     `▸ Amount: ${amount.toFixed(decimals)} ${symbol}\n` +
-                     `▸ [View Transaction](https://solscan.io/tx/${tx.transaction.signatures[0]})` +
-                     `${!verified ? '\n⚠️ *Unverified Token* - Do your research!' : ''}`;
-      
+                     `▸ Address: \`${address}\`\n` +
+                     `▸ Wallets: ${tokenData.wallets.size} (24h)\n` +
+                     `▸ Total Volume: ${tokenData.totalAmount.toFixed(decimals)} ${symbol}\n` +
+                     `▸ Price Change: ${priceChange}%\n` +
+                     `▸ [View Token](${`https://dexscreener.com/solana/${address}`})\n` +
+                     `${!verified ? '\n⚠️ *Unverified Token* - DYOR!' : ''}`;
+
       await sendTelegramAlert(message);
-
-      if (!tokenPurchases[mint]) {
-        tokenPurchases[mint] = {
-          symbol,
-          name,
-          address,
-          wallets: new Set(),
-          count: 0
-        };
-      }
-
-      tokenPurchases[mint].wallets.add(wallet);
-      tokenPurchases[mint].count++;
-
-      if (tokenPurchases[mint].wallets.size >= 3) {
-        const coordMessage = `🚨 *Coordinated Buying Detected!*\n` +
-                            `▸ Token: [${symbol} (${name})](${logoURI || `https://solscan.io/token/${address}`})\n` +
-                            `▸ Token Address: \`${address}\`\n` +
-                            `▸ Wallets: ${tokenPurchases[mint].wallets.size}\n` +
-                            `▸ Total Purchases: ${tokenPurchases[mint].count}\n` +
-                            `▸ [View Token](https://solscan.io/token/${address})` +
-                            `${!verified ? '\n⚠️ *Unverified Token* - Exercise caution!' : ''}`;
-        await sendTelegramAlert(coordMessage);
-        tokenPurchases[mint].wallets.clear();
-        tokenPurchases[mint].count = 0;
-      }
+      
+      // Reset after alert to avoid duplicates
+      delete dailyTokenPurchases[today][mint];
     }
   } catch (error) {
     console.error('Error in handleTokenTransfer:', error);
   }
 }
 
+// Add this helper function
+async function getTokenPrice(mintAddress) {
+  try {
+    // Use Jupiter API for price
+    const response = await axios.get(`https://price.jup.ag/v4/price?ids=${mintAddress}`);
+    return response.data.data[mintAddress]?.price || 0;
+  } catch (error) {
+    console.error(`Error getting price for ${mintAddress}:`, error.message);
+    return 0;
+  }
+}  
+          //end new change
 async function detectSwaps(tx, wallet) {
   try {
     const preBalances = tx.meta.preTokenBalances;
