@@ -1,13 +1,14 @@
 {
-  "name": "solana-wallet-tracker",
-  "version": "1.0.0",
+  "name": "solana-tracker",
+  "version": "2.0.0",
   "main": "tracker.js",
   "scripts": {
     "start": "node tracker.js"
   },
   "dependencies": {
-    "@solana/web3.js": "^1.73.0",
-    "axios": "^1.6.7"
+    "@solana/web3.js": "^1.100.0",
+    "axios": "^1.6.7",
+    "node-telegram-bot-api": "^0.61.0"
   },
   "engines": {
     "node": ">=18.x"
