@@ -2,6 +2,7 @@
   "name": "solana-wallet-tracker",
   "version": "1.0.0",
   "description": "Tracks Solana wallet activity and sends Telegram alerts",
+  "license": "MIT",
   "main": "tracker.js",
   "scripts": {
     "start": "node tracker.js",
@@ -10,7 +11,7 @@
   "dependencies": {
     "@solana/web3.js": "^1.73.0",
     "axios": "^1.6.7",
-    "axios-rate-limit": "^3.0.0"
+    "axios-rate-limit": "3.0.2"
   },
   "engines": {
     "node": ">=18.x"
