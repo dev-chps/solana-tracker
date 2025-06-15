@@ -240,7 +240,7 @@ async function detectSwaps(tx, wallet) {
       return;
     }
 
-    if (usdValue < 1000) return;
+    if (usdValue < 5000) return;
 
     const message = `💎 *Large Swap Detected* ($${usdValue.toFixed(2)})\n` +
                    `▸ Wallet: \`${shortAddress(wallet)}\`\n` +
