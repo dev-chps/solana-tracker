@@ -8,22 +8,28 @@ const { Connection, PublicKey } = require('@solana/web3.js');
 class PriceService {
   constructor() {
     this.cache = new Map();
-    this.cacheDuration = 300000; // 5 minutes cache
+    this.cacheDuration = 300000; // 5 minutes
   }
 
   async getPrice(mintAddress) {
+    // SOL and WSOL use same price
+    if (mintAddress === 'So11111111111111111111111111111111111111112' || 
+        mintAddress === 'So11111111111111111111111111111111111111112') {
+      mintAddress = 'SOL'; // Normalize SOL/WSOL
+    }
+
     // Check cache first
     const cached = this.cache.get(mintAddress);
     if (cached && Date.now() - cached.timestamp < this.cacheDuration) {
       return cached.price;
     }
 
-    // Try all available APIs
+    // Try all APIs
     const sources = [
       this._tryJupiterPrice.bind(this),
       this._tryBirdeyePrice.bind(this),
-      this._tryCoingeckoSolPrice.bind(this),
-      this._tryBinanceSolPrice.bind(this)
+      this._tryCoingeckoPrice.bind(this),
+      this._tryBinancePrice.bind(this)
     ];
 
     for (const source of sources) {
@@ -38,7 +44,7 @@ class PriceService {
       }
     }
 
-    return cached?.price || 0; // Fallback to cached or 0
+    return cached?.price || 0;
   }
 
   async _tryJupiterPrice(mintAddress) {
@@ -55,14 +61,14 @@ class PriceService {
     return response.data.data?.value;
   }
 
-  async _tryCoingeckoSolPrice() {
+  async _tryCoingeckoPrice() {
     const response = await axios.get('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd', {
       timeout: 2000
     });
     return response.data.solana?.usd;
   }
 
-  async _tryBinanceSolPrice() {
+  async _tryBinancePrice() {
     const response = await axios.get('https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT', {
       timeout: 2000
     });
@@ -73,13 +79,17 @@ class PriceService {
 const priceService = new PriceService();
 
 // ======================
-// 2. CORE CONFIGURATION
+// 2. CONFIGURATION
 // ======================
 const RPC_URL = process.env.RPC_URL || 'https://api.mainnet-beta.solana.com';
 const WALLETS = process.env.WALLETS ? process.env.WALLETS.split(',') : [];
 const TG_TOKEN = process.env.TG_TOKEN;
 const TG_CHAT_ID = process.env.TG_CHAT_ID;
-const CHECK_INTERVAL = process.env.CHECK_INTERVAL || 5 * 60 * 1000; // 5 minutes
+const CHECK_INTERVAL = process.env.CHECK_INTERVAL || 5 * 60 * 1000; // 5 mins
+
+// Token addresses
+const SOL_MINT = 'So11111111111111111111111111111111111111112';
+const WSOL_MINT = 'So11111111111111111111111111111111111111112'; // Same as SOL
 
 const connection = new Connection(RPC_URL, 'confirmed');
 const tokenPurchases = {};
@@ -93,6 +103,18 @@ function shortAddress(address, chars = 4) {
 }
 
 async function getTokenDetails(mintAddress) {
+  // Handle SOL/WSOL specially
+  if (mintAddress === SOL_MINT || mintAddress === WSOL_MINT) {
+    return {
+      address: mintAddress,
+      symbol: 'SOL',
+      name: 'Solana',
+      decimals: 9,
+      logoURI: 'https://raw.githubusercontent.com/solana-labs/token-list/main/assets/mainnet/So11111111111111111111111111111111111111112/logo.png',
+      verified: true
+    };
+  }
+
   try {
     const response = await axios.get(`https://token.jup.ag/strict/${mintAddress}`, {
       timeout: 2000
@@ -149,7 +171,7 @@ async function sendTelegramAlert(message) {
 }
 
 // ======================
-// 4. SWAP DETECTION
+// 4. SWAP DETECTION ($1000+)
 // ======================
 async function detectSwaps(tx, wallet) {
   try {
@@ -178,12 +200,13 @@ async function detectSwaps(tx, wallet) {
     const changedTokens = Object.keys(changes);
     if (changedTokens.length !== 2) return;
 
+    // Get prices for both tokens
     const [tokenA, tokenB] = await Promise.all([
       { ...changes[changedTokens[0]], price: await priceService.getPrice(changedTokens[0]) },
       { ...changes[changedTokens[1]], price: await priceService.getPrice(changedTokens[1]) }
     ]);
 
-    // Determine swap direction and USD value
+    // Determine swap direction
     let tokenIn, tokenOut, usdValue;
     if (tokenA.change > 0 && tokenB.change < 0) {
       tokenOut = tokenA;
@@ -197,12 +220,13 @@ async function detectSwaps(tx, wallet) {
       return; // Not a valid swap
     }
 
-    // Only alert for significant swaps ($100+)
-    if (usdValue < 100) return;
+    // Only alert for swaps > $1000 USD value
+    const MIN_SWAP_VALUE = 1000;
+    if (usdValue < MIN_SWAP_VALUE) return;
 
-    const message = `🔀 *Swap Detected* ($${usdValue.toFixed(2)})\n` +
+    const message = `💎 *Large Swap Detected* ($${usdValue.toFixed(2)})\n` +
                    `▸ Wallet: \`${shortAddress(wallet)}\`\n` +
-                   `▸ Sold: ${Math.abs(tokenIn.change).toFixed(tokenIn.decimals)} ${tokenIn.symbol}\n` +
+                   `▸ Sold: ${Math.abs(tokenIn.change).toFixed(tokenIn.decimals)} ${tokenIn.symbol} ($${(Math.abs(tokenIn.change)*tokenIn.price).toFixed(2)})\n` +
                    `▸ Bought: ${Math.abs(tokenOut.change).toFixed(tokenOut.decimals)} ${tokenOut.symbol}\n` +
                    `▸ [Chart](https://dexscreener.com/solana/${tokenOut.address})\n` +
                    `▸ [Transaction](https://solscan.io/tx/${tx.transaction.signatures[0]})`;
@@ -215,7 +239,7 @@ async function detectSwaps(tx, wallet) {
 }
 
 // ======================
-// 5. WALLET MONITORING
+// 5. WALLET TRACKING
 // ======================
 async function checkWalletTransactions(wallet) {
   try {
@@ -258,9 +282,38 @@ async function analyzeTransaction(tx, wallet) {
   }
 }
 
+async function handleTokenTransfer(parsedIx, wallet, tx) {
+  try {
+    const { mint, tokenAmount, destination } = parsedIx.info;
+    if (destination !== wallet || !tokenAmount?.uiAmount) return;
+
+    const tokenInfo = await getTokenDetails(mint);
+    const message = `🛒 *Token Received*\n` +
+                   `▸ Wallet: \`${shortAddress(wallet)}\`\n` +
+                   `▸ Amount: ${tokenAmount.uiAmount.toFixed(tokenInfo.decimals)} ${tokenInfo.symbol}\n` +
+                   `▸ [Transaction](https://solscan.io/tx/${tx.transaction.signatures[0]})` +
+                   `${!tokenInfo.verified ? '\n⚠️ *Unverified Token*' : ''}`;
+
+    await sendTelegramAlert(message);
+
+  } catch (error) {
+    console.error('Transfer handling error:', error.message);
+  }
+}
+
 // ======================
 // 6. MAIN SERVER
 // ======================
+async function checkWallets() {
+  try {
+    for (const wallet of WALLETS) {
+      await checkWalletTransactions(wallet);
+    }
+  } catch (error) {
+    console.error("CheckWallets error:", error);
+  }
+}
+
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({
@@ -268,8 +321,8 @@ const server = http.createServer((req, res) => {
     wallets: WALLETS.length,
     lastChecked: new Date().toISOString()
   }));
-}).listen(process.env.PORT || 3000, () => {
-  console.log(`Server running on port ${process.env.PORT || 3000}`);
+}).listen(process.env.PORT || 10000, () => {
+  console.log(`Server running on port ${process.env.PORT || 10000}`);
   checkWallets();
   setInterval(checkWallets, CHECK_INTERVAL);
 });
