@@ -2,21 +2,16 @@ const http = require('http');
 const { Connection, PublicKey } = require('@solana/web3.js');
 const axios = require('axios');
 
-// Simple but effective rate limiting
-let lastRequestTime = 0;
+/ Simple but effective rate limiting
+let lastCallTime = 0;
 axios.interceptors.request.use(async (config) => {
   const now = Date.now();
-  const delay = Math.max(0, 1000 - (now - lastRequestTime));
+  const delay = Math.max(0, 1000 - (now - lastCallTime)); // 1 second between requests
   await new Promise(resolve => setTimeout(resolve, delay));
-  lastRequestTime = Date.now();
+  lastCallTime = now;
   return config;
 });
 
-// Configure rate-limited axios instance
-const httpClient = rateLimit(axios.create(), {
-  maxRequests: 5,
-  perMilliseconds: 1000
-});
 
 // Configuration
 const RPC_URL = process.env.RPC_URL || 'https://api.mainnet-beta.solana.com';
