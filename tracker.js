@@ -2,7 +2,20 @@ const dailyTokenPurchases = {};
 const http = require('http');
 const axios = require('axios');
 const { Connection, PublicKey } = require('@solana/web3.js');
+// Enhanced rate limiting
+let lastSolPriceCheck = 0;
+async function safeFetchSOLPrice() {
+  const now = Date.now();
+  const minDelay = 30000; // 30 seconds between price checks
+  
+  if (now - lastSolPriceCheck < minDelay) {
+    return solPrice; // Return cached value
+  }
 
+  lastSolPriceCheck = now;
+  await fetchSOLPrice();
+  return solPrice;
+}
 // 1. Rate Limiting Setup
 let lastRequestTime = 0;
 axios.interceptors.request.use(async (config) => {
@@ -28,15 +41,43 @@ let solPrice = 0;
 // 4. Helper Functions
 async function fetchSOLPrice() {
   try {
-    const response = await axios.get(SOL_PRICE_API);
-    solPrice = response.data.solana.usd;
-    console.log(`Current SOL price: $${solPrice}`);
+    // Try multiple price sources with fallbacks
+    const sources = [
+      'https://price.jup.ag/v4/price?ids=SOL',
+      'https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd',
+      'https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT'
+    ];
+
+    for (const url of sources) {
+      try {
+        const response = await axios.get(url, { timeout: 2000 });
+        
+        if (url.includes('jup.ag')) {
+          solPrice = response.data.data.SOL.price;
+        } 
+        else if (url.includes('coingecko')) {
+          solPrice = response.data.solana.usd;
+        }
+        else if (url.includes('binance')) {
+          solPrice = parseFloat(response.data.price);
+        }
+
+        if (solPrice) {
+          console.log(`SOL price: $${solPrice} (from ${new URL(url).hostname})`);
+          return;
+        }
+      } catch (error) {
+        console.log(`Failed ${url}: ${error.message}`);
+      }
+    }
+
+    throw new Error('All price APIs failed');
+    
   } catch (error) {
-    console.error("Error fetching SOL price:", error.message);
-    solPrice = 20; // Fallback price
+    console.error("Price fetch error:", error.message);
+    solPrice = 20; // Fallback value
   }
 }
-
 async function sendTelegramAlert(message) {
   if (!TG_TOKEN || !TG_CHAT_ID) {
     console.log("Telegram alert would be:", message);
