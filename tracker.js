@@ -2,7 +2,7 @@ const http = require('http');
 const { Connection, PublicKey } = require('@solana/web3.js');
 const axios = require('axios');
 
-/ Simple but effective rate limiting
+// Simple but effective rate limiting
 let lastCallTime = 0;
 axios.interceptors.request.use(async (config) => {
   const now = Date.now();
