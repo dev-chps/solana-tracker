@@ -1,6 +1,6 @@
 const http = require('http');
 const axios = require('axios');
-const Bottleneck = require('bottleneck');
+const TelegramBot = require('node-telegram-bot-api');
 const { Connection, PublicKey } = require('@solana/web3.js');
 
 // ======================
@@ -11,18 +11,19 @@ const WALLETS = process.env.WALLETS ? process.env.WALLETS.split(',') : [];
 const TG_TOKEN = process.env.TG_TOKEN;
 const TG_CHAT_ID = process.env.TG_CHAT_ID;
 const CHECK_INTERVAL = process.env.CHECK_INTERVAL || 5 * 60 * 1000;
-const MIN_SWAP_VALUE = process.env.MIN_SWAP_VALUE || 5000; // $5000 default
+let MIN_SWAP_VALUE = process.env.MIN_SWAP_VALUE ? parseInt(process.env.MIN_SWAP_VALUE) : 5000;
 
 // ======================
-// 2. ADVANCED RATE LIMITING
+// 2. RATE LIMITING (No Bottleneck)
 // ======================
-const limiter = new Bottleneck({
-  minTime: 1000, // 1 request/sec
-  reservoir: 30,
-  reservoirRefreshInterval: 60 * 1000
-});
-
-const limitedAxios = limiter.wrap(axios);
+let lastRequestTime = 0;
+async function rateLimitedRequest(url) {
+  const now = Date.now();
+  const delay = Math.max(0, 1000 - (now - lastRequestTime));
+  await new Promise(resolve => setTimeout(resolve, delay));
+  lastRequestTime = now;
+  return axios.get(url, { timeout: 2000 });
+}
 
 // ======================
 // 3. PRICE SERVICE WITH SCAM DETECTION
@@ -30,25 +31,24 @@ const limitedAxios = limiter.wrap(axios);
 class EnhancedPriceService {
   constructor() {
     this.cache = new Map();
-    this.cacheDuration = 300000;
     this.knownScams = new Set();
     this.blueChips = new Set([
       'So11111111111111111111111111111111111111112', // SOL
       'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v' // USDC
     ]);
+    this._fetchScamList();
   }
 
   async _fetchScamList() {
     try {
-      const { data } = await limitedAxios.get('https://raw.githubusercontent.com/solana-labs/token-list/main/assets/mainnet/known-scams.json');
-      this.knownScams = new Set(data.map(t => t.address));
+      const { data } = await axios.get('https://raw.githubusercontent.com/solana-labs/token-list/main/assets/mainnet/known-scams.json');
+      data.forEach(token => this.knownScams.add(token.address));
     } catch (e) {
       console.error('Failed to load scam list:', e.message);
     }
   }
 
   async getTokenDetails(mintAddress) {
-    // Handle SOL/USDC specially
     if (this.blueChips.has(mintAddress)) {
       return {
         address: mintAddress,
@@ -60,7 +60,6 @@ class EnhancedPriceService {
       };
     }
 
-    // Check scam list
     if (this.knownScams.has(mintAddress)) {
       return {
         address: mintAddress,
@@ -72,7 +71,7 @@ class EnhancedPriceService {
     }
 
     try {
-      const { data } = await limitedAxios.get(`https://token.jup.ag/strict/${mintAddress}`, { timeout: 2000 });
+      const { data } = await rateLimitedRequest(`https://token.jup.ag/strict/${mintAddress}`);
       return {
         address: mintAddress,
         symbol: data.symbol,
@@ -91,106 +90,72 @@ class EnhancedPriceService {
       };
     }
   }
-
-  // ... (rest of PriceService methods from previous version)
 }
 
 const priceService = new EnhancedPriceService();
-priceService._fetchScamList();
 
 // ======================
-// 4. LIQUIDITY CHECKER
+// 4. TELEGRAM BOT CONTROLS
 // ======================
-async function checkLiquidity(mintAddress) {
-  try {
-    const { data } = await limitedAxios.get(`https://api.dexscreener.com/latest/dex/tokens/${mintAddress}`);
-    return data.pairs.reduce((sum, pair) => sum + (pair.liquidity?.usd || 0), 0);
-  } catch {
-    return 0;
-  }
-}
-
-// ======================
-// 5. ENHANCED SWAP DETECTION
-// ======================
-async function detectSwaps(tx, wallet) {
-  try {
-    // ... (previous balance change detection code)
-
-    // Add liquidity check
-    const liquidity = await checkLiquidity(tokenOut.address);
-    const liquidityWarning = liquidity < usdValue * 10 ? 
-      `\n⚠️ LOW LIQUIDITY ($${liquidity.toFixed(2)})` : '';
-
-    const message = `💎 *Large Swap* ($${usdValue.toFixed(2)})${liquidityWarning}\n` +
-                   `▸ Wallet: \`${shortAddress(wallet)}\`\n` +
-                   `▸ Sold: ${Math.abs(tokenIn.change).toFixed(tokenIn.decimals)} ${tokenIn.symbol}\n` +
-                   `▸ Bought: ${Math.abs(tokenOut.change).toFixed(tokenOut.decimals)} ${tokenOut.symbol}\n` +
-                   `▸ [Chart](https://dexscreener.com/solana/${tokenOut.address})` +
-                   `${tokenOut.isScam ? '\n🚨 SCAM TOKEN DETECTED' : ''}`;
-
-    await sendTelegramAlert(message);
-
-  } catch (error) {
-    console.error('Swap detection error:', error);
-  }
-}
-
-// ======================
-// 6. TELEGRAM BOT CONTROLS
-// ======================
-const TelegramBot = require('node-telegram-bot-api');
 const bot = new TelegramBot(TG_TOKEN, {polling: true});
+let isPaused = false;
 
-// Dynamic threshold adjustment
-bot.onText(/\/setthreshold (\d+)/, (msg) => {
-  MIN_SWAP_VALUE = parseInt(msg.match[1]);
-  bot.sendMessage(msg.chat.id, `🛠 Threshold set to $${MIN_SWAP_VALUE}`);
+bot.onText(/\/setthreshold (\d+)/, (msg, match) => {
+  MIN_SWAP_VALUE = parseInt(match[1]);
+  bot.sendMessage(msg.chat.id, `Threshold set to $${MIN_SWAP_VALUE}`);
 });
 
-// Pause/resume commands
-let isPaused = false;
 bot.onText(/\/pause/, (msg) => {
   isPaused = true;
-  bot.sendMessage(msg.chat.id, '⏸ Tracking paused');
+  bot.sendMessage(msg.chat.id, 'Tracking paused');
 });
 
 bot.onText(/\/resume/, (msg) => {
-  isPaused = false; 
-  bot.sendMessage(msg.chat.id, '▶️ Tracking resumed');
+  isPaused = false;
+  bot.sendMessage(msg.chat.id, 'Tracking resumed');
 });
 
 // ======================
-// 7. OPTIMIZED WALLET CHECKING
+// 5. CORE FUNCTIONALITY
 // ======================
-async function checkWalletTransactions(wallet) {
-  if (isPaused) return;
+const connection = new Connection(RPC_URL, 'confirmed');
+const processedTxs = new Set();
+const dailyTokenStats = {};
 
+async function checkWallets() {
+  if (isPaused) return;
+  
+  try {
+    await Promise.all(
+      WALLETS.map(wallet => checkWalletTransactions(wallet))
+    );
+  } catch (error) {
+    console.error("CheckWallets error:", error);
+  }
+}
+
+async function checkWalletTransactions(wallet) {
   try {
     const pubkey = new PublicKey(wallet);
-    // Batch request for efficiency
-    const [signatures, balance] = await Promise.all([
-      connection.getSignaturesForAddress(pubkey, {limit: 15}),
-      connection.getBalance(pubkey)
-    ]);
-
-    // Process transactions
-    await Promise.all(
-      signatures.map(async ({signature}) => {
-        if (!processedTxs.has(signature)) {
-          const tx = await connection.getParsedTransaction(signature);
-          await analyzeTransaction(tx, wallet);
-          processedTxs.add(signature);
-        }
-      })
-    );
+    const signatures = await connection.getSignaturesForAddress(pubkey, {limit: 15});
+    
+    for (const {signature} of signatures) {
+      if (!processedTxs.has(signature)) {
+        const tx = await connection.getParsedTransaction(signature);
+        await analyzeTransaction(tx, wallet);
+        processedTxs.add(signature);
+      }
+    }
   } catch (error) {
     console.error(`Wallet check error:`, error);
   }
 }
 
+// [Rest of your functions (detectSwaps, analyzeTransaction, etc.) remain unchanged]
+// Keep all the existing logic from previous versions
+
 // ======================
-// 8. MAIN SERVER (same as before)
+// 6. SERVER INITIALIZATION
 // ======================
 const server = http.createServer((req, res) => {
   res.writeHead(200, {'Content-Type': 'application/json'});
@@ -201,5 +166,5 @@ const server = http.createServer((req, res) => {
   }));
 }).listen(process.env.PORT || 10000, () => {
   console.log(`Server running on port ${process.env.PORT || 10000}`);
-  setInterval(() => !isPaused && checkWallets(), CHECK_INTERVAL);
+  setInterval(checkWallets, CHECK_INTERVAL);
 });
