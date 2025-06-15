@@ -2,6 +2,7 @@ const http = require('http');
 const axios = require('axios');
 const { Connection, PublicKey } = require('@solana/web3.js');
 const NodeCache = require('node-cache');
+const fs = require('fs');
 
 // ======================
 // 1. CONFIGURATION
@@ -11,57 +12,100 @@ const WALLETS = process.env.WALLETS ? process.env.WALLETS.split(',') : [];
 const TG_TOKEN = process.env.TG_TOKEN;
 const TG_CHAT_ID = process.env.TG_CHAT_ID;
 const CHECK_INTERVAL = process.env.CHECK_INTERVAL || 5 * 60 * 1000; // 5 minutes
-let MIN_SWAP_VALUE = process.env.MIN_SWAP_VALUE ? parseInt(process.env.MIN_SWAP_VALUE) : 5000; // $5000 default
-const RATE_LIMIT_DELAY = process.env.RATE_LIMIT_DELAY || 1000; // 1 second between requests
+const MIN_SWAP_VALUE = process.env.MIN_SWAP_VALUE ? parseInt(process.env.MIN_SWAP_VALUE) : 5000;
+const MAX_RPC_REQUESTS_PER_SECOND = process.env.MAX_RPC_REQUESTS_PER_SECOND || 10;
+const TOKEN_CACHE_FILE = process.env.TOKEN_CACHE_FILE || 'token-cache.json';
 
 // ======================
 // 2. CACHE & RATE LIMITING
 // ======================
-const requestCache = new NodeCache({ stdTTL: 300 }); // 5 minute cache
+const requestCache = new NodeCache({ stdTTL: 300, checkperiod: 60 });
+const tokenDetailsCache = new NodeCache({ stdTTL: 86400 }); // 24 hour cache for token details
 const requestQueue = [];
-let isProcessing = false;
+let rpcRequestCount = 0;
+let lastRpcReset = Date.now();
 
-async function processQueue() {
-  if (isProcessing || requestQueue.length === 0) return;
-  isProcessing = true;
-
-  const { url, resolve, reject } = requestQueue.shift();
-  try {
-    const cached = requestCache.get(url);
-    if (cached) {
-      resolve(cached);
-    } else {
-      const response = await axios.get(url, { 
-        timeout: 2000,
-        headers: { 'User-Agent': 'SolanaTracker/2.0.0' }
-      });
-      requestCache.set(url, response);
-      resolve(response);
-    }
-  } catch (error) {
-    if (error.response?.status === 429) {
-      // Requeue with delay
-      requestQueue.unshift({ url, resolve, reject });
-      setTimeout(() => {
-        isProcessing = false;
-        processQueue();
-      }, 1000);
-      return;
-    }
-    reject(error);
-  }
-
-  setTimeout(() => {
-    isProcessing = false;
-    processQueue();
-  }, RATE_LIMIT_DELAY);
+// Load token cache from file if exists
+if (fs.existsSync(TOKEN_CACHE_FILE)) {
+  const cacheData = JSON.parse(fs.readFileSync(TOKEN_CACHE_FILE));
+  Object.entries(cacheData).forEach(([key, value]) => {
+    tokenDetailsCache.set(key, value);
+  });
 }
 
-function rateLimitedRequest(url) {
-  return new Promise((resolve, reject) => {
-    requestQueue.push({ url, resolve, reject });
-    processQueue();
+function saveTokenCache() {
+  const cacheData = {};
+  tokenDetailsCache.keys().forEach(key => {
+    cacheData[key] = tokenDetailsCache.get(key);
   });
+  fs.writeFileSync(TOKEN_CACHE_FILE, JSON.stringify(cacheData));
+}
+
+// Save cache every 5 minutes
+setInterval(saveTokenCache, 5 * 60 * 1000);
+
+function calculateBackoff(attempt) {
+  const baseDelay = 500; // 0.5s base
+  const maxDelay = 10000; // 10s max
+  const delay = Math.min(baseDelay * Math.pow(2, attempt), maxDelay);
+  // Add jitter
+  return delay * (0.7 + Math.random() * 0.6);
+}
+
+async function rateLimitedRequest(url, priority = 'normal', maxRetries = 3) {
+  // Reset RPC request counter every second
+  if (Date.now() - lastRpcReset > 1000) {
+    rpcRequestCount = 0;
+    lastRpcReset = Date.now();
+  }
+
+  // Check if this is an RPC request
+  const isRpcRequest = url.includes(RPC_URL);
+  
+  // Check RPC rate limit
+  if (isRpcRequest && rpcRequestCount >= MAX_RPC_REQUESTS_PER_SECOND) {
+    const delay = 1000 - (Date.now() - lastRpcReset);
+    await new Promise(resolve => setTimeout(resolve, delay));
+    return rateLimitedRequest(url, priority, maxRetries);
+  }
+
+  // Check cache first
+  const cached = requestCache.get(url);
+  if (cached) return cached;
+
+  // Execute request with retries
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      if (attempt > 0) {
+        const backoff = calculateBackoff(attempt);
+        await new Promise(resolve => setTimeout(resolve, backoff));
+      }
+
+      if (isRpcRequest) rpcRequestCount++;
+      
+      const response = await axios.get(url, {
+        timeout: 3000,
+        headers: {
+          'User-Agent': 'SolanaTracker/2.1.0',
+          'Accept': 'application/json'
+        }
+      });
+
+      // Cache successful responses
+      requestCache.set(url, response);
+      return response;
+    } catch (error) {
+      if (error.response?.status === 404) {
+        // Cache 404s for token lookups to avoid repeated requests
+        if (url.includes('token.jup.ag')) {
+          requestCache.set(url, { data: null });
+        }
+        throw error;
+      }
+      
+      if (attempt === maxRetries - 1) throw error;
+    }
+  }
 }
 
 // ======================
@@ -69,7 +113,7 @@ function rateLimitedRequest(url) {
 // ======================
 class PriceService {
   constructor() {
-    this.cache = new Map();
+    this.priceCache = new NodeCache({ stdTTL: 300 });
     this.knownScams = new Set();
     this.blueChips = new Set([
       'So11111111111111111111111111111111111111112', // SOL
@@ -80,7 +124,10 @@ class PriceService {
 
   async loadScamList() {
     try {
-      const response = await rateLimitedRequest('https://raw.githubusercontent.com/solana-labs/token-list/main/src/tokens/solana.tokenlist.json');
+      const response = await rateLimitedRequest(
+        'https://raw.githubusercontent.com/solana-labs/token-list/main/src/tokens/solana.tokenlist.json',
+        'low'
+      );
       const scamTokens = response.data.tokens.filter(token => token.extensions?.isScam);
       scamTokens.forEach(token => this.knownScams.add(token.address));
     } catch (error) {
@@ -89,8 +136,13 @@ class PriceService {
   }
 
   async getTokenDetails(mintAddress) {
+    // Check cache first
+    const cached = tokenDetailsCache.get(mintAddress);
+    if (cached) return cached;
+
+    // Handle blue-chip tokens
     if (this.blueChips.has(mintAddress)) {
-      return {
+      const details = {
         address: mintAddress,
         symbol: mintAddress === 'So11111111111111111111111111111111111111112' ? 'SOL' : 'USDC',
         name: mintAddress === 'So11111111111111111111111111111111111111112' ? 'Solana' : 'USD Coin',
@@ -101,10 +153,13 @@ class PriceService {
           ? 'https://raw.githubusercontent.com/solana-labs/token-list/main/assets/mainnet/So11111111111111111111111111111111111111112/logo.png'
           : 'https://raw.githubusercontent.com/solana-labs/token-list/main/assets/mainnet/EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v/logo.png'
       };
+      tokenDetailsCache.set(mintAddress, details);
+      return details;
     }
 
+    // Check scam list
     if (this.knownScams.has(mintAddress)) {
-      return {
+      const details = {
         address: mintAddress,
         symbol: 'SCAM',
         name: 'Scam Token',
@@ -112,11 +167,17 @@ class PriceService {
         isScam: true,
         logoURI: ''
       };
+      tokenDetailsCache.set(mintAddress, details);
+      return details;
     }
 
+    // Try Jupiter's strict API first
     try {
-      const response = await rateLimitedRequest(`https://token.jup.ag/strict/${mintAddress}`);
-      return {
+      const response = await rateLimitedRequest(
+        `https://token.jup.ag/strict/${mintAddress}`,
+        'high'
+      );
+      const details = {
         address: mintAddress,
         symbol: response.data.symbol,
         name: response.data.name,
@@ -125,9 +186,35 @@ class PriceService {
         isScam: false,
         isBlueChip: false
       };
+      tokenDetailsCache.set(mintAddress, details);
+      return details;
     } catch (error) {
-      console.error(`Failed to fetch token ${mintAddress}:`, error.message);
-      return {
+      if (error.response?.status !== 404) {
+        console.error(`Failed to fetch token ${mintAddress}:`, error.message);
+      }
+    }
+
+    // Fallback to more lenient APIs if strict fails
+    try {
+      const response = await rateLimitedRequest(
+        `https://token.jup.ag/all/${mintAddress}`,
+        'high'
+      );
+      const details = {
+        address: mintAddress,
+        symbol: response.data.symbol || 'UNKNOWN',
+        name: response.data.name || 'Unknown Token',
+        decimals: response.data.decimals || 9,
+        logoURI: response.data.logoURI || '',
+        isScam: false,
+        isBlueChip: false
+      };
+      tokenDetailsCache.set(mintAddress, details);
+      return details;
+    } catch (error) {
+      console.error(`Failed to fetch token ${mintAddress} from fallback API:`, error.message);
+      
+      const details = {
         address: mintAddress,
         symbol: 'UNKNOWN',
         name: 'Unknown Token',
@@ -136,15 +223,15 @@ class PriceService {
         isBlueChip: false,
         logoURI: ''
       };
+      tokenDetailsCache.set(mintAddress, details);
+      return details;
     }
   }
 
   async getPrice(mintAddress) {
     const cacheKey = mintAddress === 'So11111111111111111111111111111111111111112' ? 'SOL' : mintAddress;
-    const cached = this.cache.get(cacheKey);
-    if (cached && Date.now() - cached.timestamp < 300000) {
-      return cached.price;
-    }
+    const cached = this.priceCache.get(cacheKey);
+    if (cached) return cached;
 
     const sources = [
       `https://price.jup.ag/v4/price?ids=${cacheKey}`,
@@ -155,7 +242,7 @@ class PriceService {
 
     for (const url of sources) {
       try {
-        const response = await rateLimitedRequest(url);
+        const response = await rateLimitedRequest(url, 'high');
         let price;
         
         if (url.includes('jup.ag')) price = response.data.data[cacheKey]?.price;
@@ -164,7 +251,7 @@ class PriceService {
         else if (url.includes('binance')) price = parseFloat(response.data.price);
 
         if (price) {
-          this.cache.set(cacheKey, { price, timestamp: Date.now() });
+          this.priceCache.set(cacheKey, price);
           return price;
         }
       } catch (error) {
@@ -172,10 +259,12 @@ class PriceService {
       }
     }
 
-    return cached?.price || 0;
+    return 0;
   }
 }
 
+// [Rest of your existing code remains the same, including Telegram integration, 
+// core tracking logic, transaction processing, and server setup]
 const priceService = new PriceService();
 
 // ======================
